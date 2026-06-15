@@ -1,3 +1,9 @@
+## v5.1.1 Icon Refresh
+
+- **Update: Linea Connector のアプリアイコンを更新**
+  - Windows のアプリ本体、タスクバー、デスクトップ/スタートメニューショートカット、インストーラー/アンインストーラーで使うアイコンを現行 Linea の青いロゴへ更新
+  - 小さい Windows アイコンサイズでも読みやすいよう、ワードマークを外したロゴ本体の ICO を同梱
+
 ## v5.1.0 Automatic Idle Updates
 
 - **Update: 自動ダウンロードとアイドル時の自動適用**
