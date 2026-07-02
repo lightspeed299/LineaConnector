@@ -1,3 +1,10 @@
+## v5.1.2 Icon Background Fix
+
+- **Fix: Linea Connector のアプリアイコン背景を修正**
+  - 現行 Linea の青いロゴを黒背景つきで切り出し直し
+  - Windows のアプリ本体、タスクバー、デスクトップ/スタートメニューショートカット、インストーラー/アンインストーラー用 ICO を再生成
+  - 透明背景になっていた v5.1.1 のアイコンを、Linea 本体のアプリアイコンと同じ黒背景系の見た目へ修正
+
 ## v5.1.1 Icon Refresh
 
 - **Update: Linea Connector のアプリアイコンを更新**
