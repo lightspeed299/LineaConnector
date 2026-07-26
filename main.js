@@ -170,6 +170,16 @@ let lastTurn = null;
 let currentConfig = null;
 let engineIdleShutdownTimer = null;
 
+// ★バックグラウンド全解析バッチ（サーバー主導・Connector は無状態）
+let batchQueue = []; // { jobId, sfen }[]
+let batchSecondsPerMove = 3;
+let batchActive = false;
+let batchDoneCount = 0;
+// 現在のバッチ探索を破棄して局面をキュー先頭へ戻すフック。
+// 対話解析系のハンドラが engine に stop を書く「前」に呼ぶことで、
+// 部分探索の低品質な bestmove を結果として送ってしまうのを防ぐ。
+let batchPreemptCurrent = null;
+
 function markActivity() {
   lastActivityAt = Date.now();
 }
@@ -379,6 +389,10 @@ function connectToServer(config) {
 
   socket.on('disconnect', (reason) => {
     log(`[DIAG] 切断 (reason: ${reason}, engineRunning: ${!!engineProcess})`);
+    // 再接続後はサーバーが残りから再バッチするのでローカルキューは破棄。
+    // batchActive はループ自身に落とさせる（ここで消すと再接続時に二重ループになる）
+    if (batchPreemptCurrent) batchPreemptCurrent();
+    batchQueue = [];
     sendStatus(buildStatus(false, !!engineProcess));
     if (reason === 'io server disconnect') {
       log('[DIAG] サーバー側切断 → 手動再接続を試行');
@@ -416,6 +430,8 @@ function connectToServer(config) {
     if (!sfen) return;
     lastSfen = sfen;
     lastTurn = turn;
+    // バッチ探索中なら破棄して後回し（対話解析優先）
+    if (batchPreemptCurrent) batchPreemptCurrent();
     clearEngineIdleShutdown();
     const requestSfen = sfen;
     const requestTurn = turn;
@@ -446,15 +462,51 @@ function connectToServer(config) {
     }
     log('解析停止');
     isAnalyzing = false;
+    // この stop はバッチ探索も止めてしまうので、先に現在の局面を退避する
+    if (batchPreemptCurrent) batchPreemptCurrent();
     safeWrite('stop\n');
     safeWrite('usinewgame\n');
     safeWrite('isready\n');
     scheduleEngineIdleShutdown();
   });
 
+  // ★バックグラウンド全解析: サーバーからバッチを受け取り go movetime で逐次解析
+  socket.on('connector:analyze_batch', (data) => {
+    markActivity();
+    const positions = Array.isArray(data?.positions) ? data.positions : [];
+    const jobId = typeof data?.jobId === 'string' ? data.jobId : '';
+    if (!jobId || positions.length === 0) return;
+    // サーバーは 1 バッチずつしか送らないのでキューは丸ごと置き換え
+    batchQueue = positions
+      .filter((p) => p && typeof p.sfen === 'string' && p.sfen.length > 0)
+      .map((p) => ({ jobId, sfen: p.sfen }));
+    const sec = Number(data?.secondsPerMove);
+    batchSecondsPerMove = Number.isFinite(sec)
+      ? Math.min(30, Math.max(1, Math.floor(sec)))
+      : 3;
+    startBatchLoop();
+  });
+
+  socket.on('connector:analyze_stop', (data) => {
+    markActivity();
+    const jobId = typeof data?.jobId === 'string' ? data.jobId : null;
+    // 探索中の局面をいったんキューへ戻してから該当ジョブごと落とす
+    if (batchPreemptCurrent) batchPreemptCurrent();
+    if (jobId) {
+      batchQueue = batchQueue.filter((item) => item.jobId !== jobId);
+    } else {
+      batchQueue = [];
+    }
+    // エンジンに残った探索を止める（対話解析 isAnalyzing 中はその探索を壊さない）
+    if (batchActive && !isAnalyzing) {
+      safeWrite('stop\n');
+    }
+  });
+
   socket.on('reset_engine', async () => {
     markActivity();
     if (!engineProcess) return;
+    if (batchPreemptCurrent) batchPreemptCurrent();
     log('エンジンリセット');
     try {
       const wasAnalyzing = isAnalyzing;
@@ -499,6 +551,8 @@ function connectToServer(config) {
       return;
     }
 
+    // オプション変更は stop/setoption を書くので、バッチ探索中の局面は退避する
+    if (batchPreemptCurrent) batchPreemptCurrent();
     setChangingOption(true);
 
     try {
@@ -527,6 +581,8 @@ function connectToServer(config) {
 
 function disconnectFromServer() {
   clearEngineIdleShutdown();
+  if (batchPreemptCurrent) batchPreemptCurrent();
+  batchQueue = [];
   if (engineProcess) {
     try { engineProcess.stdin.write('quit\n'); } catch (e) {}
     engineProcess.kill();
@@ -695,6 +751,162 @@ async function startEngine(config) {
   } finally {
     engineStartPromise = null;
   }
+}
+
+// --- バックグラウンド全解析ループ ---
+function startBatchLoop() {
+  if (batchActive) return;
+  batchActive = true;
+  (async () => {
+    while (batchQueue.length > 0) {
+      if (!socket?.connected) {
+        batchQueue = [];
+        break;
+      }
+      // 対話解析を優先
+      if (isAnalyzing) {
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
+      }
+      if (isChangingOption) {
+        await new Promise((r) => setTimeout(r, 500));
+        continue;
+      }
+      if (!engineProcess) {
+        if (isOnDemandEngineMode(currentConfig)) {
+          log('省メモリモード: バッチ解析のためエンジンを起動します');
+        }
+        const started = await startEngine(currentConfig);
+        if (!started || !engineProcess) {
+          log('バッチ解析を中止: エンジンが起動していません');
+          batchQueue = [];
+          break;
+        }
+      }
+      clearEngineIdleShutdown();
+      const item = batchQueue.shift();
+      if (!item) break;
+      await analyzeBatchPosition(item);
+    }
+    batchActive = false;
+    scheduleEngineIdleShutdown();
+  })().catch((err) => {
+    log(`バッチ解析ループエラー: ${err?.message || err}`);
+    batchActive = false;
+    batchQueue = [];
+    scheduleEngineIdleShutdown();
+  });
+}
+
+function analyzeBatchPosition({ jobId, sfen }) {
+  return new Promise((resolve) => {
+    const proc = engineProcess;
+    if (!proc || !socket?.connected) {
+      resolve();
+      return;
+    }
+
+    const movetimeMs = batchSecondsPerMove * 1000;
+    let lastScoreInfo = null;
+    let settled = false;
+
+    const cleanup = () => {
+      if (batchPreemptCurrent === preempt) batchPreemptCurrent = null;
+      proc.stdout.off('data', onData);
+    };
+
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (payload && socket?.connected) {
+        socket.emit('connector:analysis_result', payload);
+        batchDoneCount += 1;
+        if (batchDoneCount % 10 === 0) {
+          log(`バッチ解析: ${batchDoneCount} 局面完了 (残り ${batchQueue.length})`);
+        }
+      }
+      resolve();
+    };
+
+    // 対話解析などに横取りされたら結果を破棄してキュー先頭へ戻す。
+    // 呼び出し元（request_analysis / stop_analysis / reset_engine /
+    // set_engine_option / analyze_stop / disconnect）が engine に書く前に呼ぶ。
+    // ここでは stop を書かない: 直後に対話解析の go infinite が始まっている
+    // 可能性があり、書くとその探索まで止めてしまう。
+    const preempt = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      batchQueue.unshift({ jobId, sfen });
+      resolve();
+    };
+    batchPreemptCurrent = preempt;
+
+    const buildPayload = () => {
+      const payload = { jobId, sfen };
+      if (lastScoreInfo) {
+        const mateMatch = lastScoreInfo.match(/score mate (-?\d+)/);
+        const cpMatch = lastScoreInfo.match(/score cp (-?\d+)/);
+        if (mateMatch) payload.scoreMate = parseInt(mateMatch[1], 10);
+        else if (cpMatch) payload.scoreCp = parseInt(cpMatch[1], 10);
+      }
+      return payload;
+    };
+
+    const onData = (chunk) => {
+      for (const line of chunk.toString().split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        if (trimmed.startsWith('info') && trimmed.includes('score')) {
+          // multipv 1（または multipv 無し）の最新だけ保持
+          const mpvMatch = trimmed.match(/multipv (\d+)/);
+          const mpv = mpvMatch ? parseInt(mpvMatch[1], 10) : 1;
+          if (mpv === 1) lastScoreInfo = trimmed;
+        }
+        if (trimmed.startsWith('bestmove')) {
+          // フック経由を通らずに対話解析が始まっていたら、
+          // この bestmove は途中打ち切りの低品質値なので捨てて再キューする
+          if (isAnalyzing) {
+            preempt();
+            return;
+          }
+          const moveToken = trimmed.split(/\s+/)[1] || '';
+          const payload = buildPayload();
+          if (moveToken && moveToken !== 'resign' && moveToken !== 'win') {
+            payload.bestMove = moveToken;
+          }
+          finish(payload);
+          return;
+        }
+      }
+    };
+
+    proc.stdout.on('data', onData);
+
+    safeWrite(`position sfen ${sanitizeUSI(sfen)}\n`);
+    safeWrite(`go movetime ${movetimeMs}\n`);
+
+    const timeoutMs = movetimeMs + 15_000;
+    setTimeout(() => {
+      if (settled) return;
+      if (isAnalyzing) {
+        // 対話解析中に stop を書くとその探索を壊すので、破棄して再キュー
+        preempt();
+        return;
+      }
+      safeWrite('stop\n');
+      setTimeout(() => {
+        if (settled) return;
+        // タイムアウト時も最後の score があれば返す
+        if (lastScoreInfo) {
+          finish(buildPayload());
+        } else {
+          finish(null);
+        }
+      }, 2000);
+    }, timeoutMs);
+  });
 }
 
 // --- 補助関数 ---
