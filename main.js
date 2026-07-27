@@ -174,7 +174,11 @@ let engineIdleShutdownTimer = null;
 let batchQueue = []; // { jobId, sfen }[]
 let batchSecondsPerMove = 3;
 let batchActive = false;
-let batchDoneCount = 0;
+// ジョブ全体の進捗（サーバーが analyze_batch に載せてくる doneCount/totalCount が正）。
+// jobId が変わったらリセットする。
+let batchJobId = null;
+let batchJobDone = 0;
+let batchJobTotal = 0;
 // 現在のバッチ探索を破棄して局面をキュー先頭へ戻すフック。
 // 対話解析系のハンドラが engine に stop を書く「前」に呼ぶことで、
 // 部分探索の低品質な bestmove を結果として送ってしまうのを防ぐ。
@@ -484,6 +488,18 @@ function connectToServer(config) {
     batchSecondsPerMove = Number.isFinite(sec)
       ? Math.min(30, Math.max(1, Math.floor(sec)))
       : 3;
+    // ジョブ全体の進捗をサーバーの値に同期（再送でローカルカウントがずれても補正される）
+    const done = Number(data?.doneCount);
+    const total = Number(data?.totalCount);
+    if (jobId !== batchJobId) {
+      batchJobId = jobId;
+      batchJobDone = Number.isFinite(done) && done >= 0 ? done : 0;
+      batchJobTotal = Number.isFinite(total) && total > 0 ? total : 0;
+      log(`バッチ解析ジョブ受信 (全 ${batchJobTotal || '?'} 局面, ${batchSecondsPerMove}秒/手)`);
+    } else {
+      if (Number.isFinite(done) && done >= 0) batchJobDone = done;
+      if (Number.isFinite(total) && total > 0) batchJobTotal = total;
+    }
     startBatchLoop();
   });
 
@@ -821,9 +837,11 @@ function analyzeBatchPosition({ jobId, sfen }) {
       cleanup();
       if (payload && socket?.connected) {
         socket.emit('connector:analysis_result', payload);
-        batchDoneCount += 1;
-        if (batchDoneCount % 10 === 0) {
-          log(`バッチ解析: ${batchDoneCount} 局面完了 (残り ${batchQueue.length})`);
+        batchJobDone += 1;
+        // 10 局面ごと・ジョブ完走時にジョブ全体の進捗を出す
+        // （ローカルキューは現在バッチの残りでしかないため表示しない）
+        if (batchJobDone % 10 === 0 || batchJobDone === batchJobTotal) {
+          log(`バッチ解析: ${batchJobDone}/${batchJobTotal || '?'} 局面完了`);
         }
       }
       resolve();
