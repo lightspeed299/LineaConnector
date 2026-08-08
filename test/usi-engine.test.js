@@ -269,6 +269,33 @@ test('stderr大量出力でも詰まらない(drain)', async () => {
   });
 });
 
+test('未flushの予約search(初期化中)がstopで宙吊りにならずpreempted解決される', async () => {
+  await withEngine({ behaviors: ['slow-readyok'] }, async (engine) => {
+    await engine.launch(); // launch自体のreadyokも150ms遅い
+    const ng = engine.newGame(); // 適用サイクル開始(150msのINITIALIZING窓)
+    const p = engine.search('POS_PENDING', 1000); // 予約だけされ、まだflushされない
+    engine.stop(); // 予約を取り消す
+    const res = await p;
+    assert.equal(res.status, 'preempted');
+    await ng;
+    assert.ok(!sent(engine).some((l) => l.startsWith('go movetime')), 'goは送られない');
+  });
+});
+
+test('未flushの予約searchがanalyzeの上書きでもpreempted解決される', async () => {
+  await withEngine({ behaviors: ['slow-readyok'] }, async (engine) => {
+    await engine.launch();
+    const ng = engine.newGame();
+    const p = engine.search('POS_PENDING', 1000);
+    engine.analyze('POS_LIVE'); // 予約を上書き
+    const res = await p;
+    assert.equal(res.status, 'preempted');
+    await ng;
+    await waitFor(() => sent(engine).includes('go infinite'), 3000, 'live go');
+    assert.ok(!sent(engine).some((l) => l.startsWith('go movetime')));
+  });
+});
+
 test('未知のゴミ行が混ざっても解析は継続する', async () => {
   await withEngine({ behaviors: ['noisy'] }, async (engine) => {
     const infos = [];

@@ -7,6 +7,7 @@
 //   noisy        … 未知のゴミ行を混ぜる
 //   slow-usiok   … usiok を返さない
 //   no-readyok   … readyok を返さない
+//   slow-readyok … readyok を150ms遅らせる(INITIALIZING窓の検証用)
 //   no-bestmove  … stop を無視する(bestmove を返さない)
 //   crash-on-go  … go を受けたら exit(42)
 //   stderr-spam  … 起動時に stderr へ 256KB 書く(drain 検証)
@@ -82,7 +83,9 @@ rl.on('line', (raw) => {
     return;
   }
   if (line === 'isready') {
-    if (!has('no-readyok')) out('readyok');
+    if (has('no-readyok')) return;
+    if (has('slow-readyok')) { setTimeout(() => out('readyok'), 150); return; }
+    out('readyok');
     return;
   }
   if (line === 'usinewgame') return;

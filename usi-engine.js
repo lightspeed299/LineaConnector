@@ -525,8 +525,19 @@ class UsiEngine {
 
   // ---- 公開 API ----
 
+  // 予約中でまだ flush していない go を破棄する。
+  // movetime のチケットを持っていたら preempted で必ず解決する(宙吊り防止)。
+  _dropReservedGo() {
+    const go = this.reservedGo;
+    this.reservedGo = null;
+    if (go && go.spec && go.spec.ticket) {
+      go.spec.ticket.resolve({ status: 'preempted' });
+    }
+  }
+
   /** 対話解析(go infinite)。探索中なら予約+暗黙 stop。 */
   analyze(sfen) {
+    this._dropReservedGo();
     this.reservedGo = { sfen, spec: { infinite: true } };
     this._dispatch();
   }
@@ -547,6 +558,7 @@ class UsiEngine {
         this.currentSearch.resolve({ status: 'preempted' });
         this.currentSearch = null;
       }
+      this._dropReservedGo();
       this.reservedGo = { sfen, spec: { movetimeMs, ticket } };
       this._dispatch();
     });
@@ -579,7 +591,7 @@ class UsiEngine {
    * 予約済みでまだ送っていない go も取り消す。
    */
   stop({ discardSearch = false } = {}) {
-    this.reservedGo = null;
+    this._dropReservedGo();
     if (this.state !== STATE.SEARCHING) return;
     if (discardSearch && this.currentSearch) {
       this.currentSearch.resolve({ status: 'preempted' });
@@ -673,7 +685,7 @@ class UsiEngine {
       this.currentSearch.resolve({ status: 'preempted' });
       this.currentSearch = null;
     }
-    this.reservedGo = null;
+    this._dropReservedGo();
     this.reservedOptions = [];
     this.newGamePending = false;
     if (this.readyWaiters.length > 0) {
