@@ -7,6 +7,7 @@ module.exports = {
   productName: 'Linea Connector',
   files: [
     'main.js',
+    'usi-engine.js',
     'preload.js',
     'renderer/**/*',
     'assets/**/*',
