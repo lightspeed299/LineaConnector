@@ -1,4 +1,4 @@
-## v5.4.0 USI Engine Overhaul
+## v6.0.0 USI Engine Overhaul
 
 - **Rewrite: USIエンジン制御を状態機械ベースへ全面刷新**
   - stdout を行単位で処理し、高NPS時に評価値・読み筋が欠落する可能性を根絶
