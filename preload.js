@@ -16,6 +16,9 @@ contextBridge.exposeInMainWorld('connector', {
   connect: (config) => ipcRenderer.invoke('connect', config),
   disconnect: () => ipcRenderer.invoke('disconnect'),
 
+  // USI通信ログ（直近100件）
+  getUsiHistory: () => ipcRenderer.invoke('get-usi-history'),
+
   // 自動アップデート
   checkForUpdate: () => ipcRenderer.invoke('check-for-update'),
   downloadUpdate: () => ipcRenderer.invoke('download-update'),

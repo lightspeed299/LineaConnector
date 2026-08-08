@@ -4,8 +4,8 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const io = require('socket.io-client');
-const { spawn } = require('child_process');
 const { autoUpdater } = require('electron-updater');
+const { UsiEngine } = require('./usi-engine');
 
 const CURRENT_VERSION = `v${require('./package.json').version}`;
 const DEFAULT_SERVER_URL = 'https://api.lineashogi.com';
@@ -61,12 +61,23 @@ function normalizeServerUrl(value) {
   return serverUrl;
 }
 
+// 旧キー fv_scale(小文字)を FV_SCALE へ移行する。
+// USIオプション名は宣言と突き合わせて解決されるため実害は少ないが、表記を正に統一する。
+function normalizeEngineOptions(options) {
+  const src = { ...(options || {}) };
+  if (src.fv_scale !== undefined && src.FV_SCALE === undefined) {
+    src.FV_SCALE = src.fv_scale;
+  }
+  delete src.fv_scale;
+  return src;
+}
+
 function normalizeConfig(config) {
   return {
     ...config,
     serverUrl: normalizeServerUrl(config?.serverUrl),
     engineMode: getEngineMode(config),
-    engineOptions: { ...(config?.engineOptions || {}) },
+    engineOptions: normalizeEngineOptions(config?.engineOptions),
   };
 }
 
@@ -78,7 +89,7 @@ function isOnDemandEngineMode(config = currentConfig) {
   return getEngineMode(config) === ENGINE_MODE_ON_DEMAND;
 }
 
-function buildStatus(connected = !!socket?.connected, engineRunning = !!engineProcess) {
+function buildStatus(connected = !!socket?.connected, engineRunning = !!(engine && engine.running)) {
   return {
     connected,
     engineRunning,
@@ -122,7 +133,7 @@ function loadConfig() {
       const normalized = normalizeConfig(parsed);
       if (configsDiffer(parsed, normalized)) {
         fs.writeFileSync(CONFIG_PATH, JSON.stringify(normalized, null, 2));
-        log('旧サーバーURLをLinea APIへ移行しました');
+        log('設定ファイルを最新形式へ移行しました');
       }
       return normalized;
     }
@@ -154,21 +165,17 @@ function sendStatus(status) {
   }
 }
 
-// --- USI入力サニタイズ ---
-function sanitizeUSI(str) {
-  return String(str).replace(/[\r\n\x00-\x1f]/g, '');
-}
-
 // --- Socket.io + Engine ---
 let socket = null;
-let engineProcess = null;
-let isAnalyzing = false;
-let isChangingOption = false;
-let isChangingOptionTimer = null;
+let engine = null;               // UsiEngine | null
+let engineStartPromise = null;
+let isAnalyzing = false;         // ブラウザ意図としての対話解析中フラグ
 let lastSfen = null;
 let lastTurn = null;
 let currentConfig = null;
 let engineIdleShutdownTimer = null;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ★バックグラウンド全解析バッチ（サーバー主導・Connector は無状態）
 let batchQueue = []; // { jobId, sfen }[]
@@ -179,10 +186,8 @@ let batchActive = false;
 let batchJobId = null;
 let batchJobDone = 0;
 let batchJobTotal = 0;
-// 現在のバッチ探索を破棄して局面をキュー先頭へ戻すフック。
-// 対話解析系のハンドラが engine に stop を書く「前」に呼ぶことで、
-// 部分探索の低品質な bestmove を結果として送ってしまうのを防ぐ。
-let batchPreemptCurrent = null;
+// analyze_stop で止められたジョブ。preempted 再キュー時の復活を防ぐ。
+const stoppedBatchJobs = new Set();
 
 function markActivity() {
   lastActivityAt = Date.now();
@@ -193,36 +198,22 @@ const ENGINE_RESTART_LIMIT = 3;
 const ENGINE_RESTART_WINDOW_MS = 60 * 1000;
 let engineRestartTimestamps = [];
 
-// ★安全な stdin.write ヘルパー（破損パイプへの書き込みを防止）
-function safeWrite(cmd) {
-  if (engineProcess && engineProcess.stdin && engineProcess.stdin.writable) {
-    try {
-      engineProcess.stdin.write(cmd);
-      return true;
-    } catch (e) {
-      log(`stdin書き込みエラー: ${e.message}`);
-      return false;
-    }
-  }
-  return false;
-}
+// ★info行スロットリング: MultiPVごとに最新のみ150ms間隔で送信（NPS改善）
+const INFO_THROTTLE_MS = 150;
+const pendingInfoByMultipv = new Map(); // multipv -> payload
+let infoFlushTimer = null;
 
-// ★isChangingOption 安全タイムアウト設定/解除
-function setChangingOption(value) {
-  isChangingOption = value;
-  if (isChangingOptionTimer) {
-    clearTimeout(isChangingOptionTimer);
-    isChangingOptionTimer = null;
-  }
-  if (value) {
-    isChangingOptionTimer = setTimeout(() => {
-      if (isChangingOption) {
-        log('⚠️ isChangingOption 安全タイムアウト: 強制リセット');
-        isChangingOption = false;
-        isChangingOptionTimer = null;
-      }
-    }, 15000);
-  }
+function queueAnalysisUpdate(multipv, payload) {
+  pendingInfoByMultipv.set(multipv, payload);
+  if (infoFlushTimer) return;
+  infoFlushTimer = setTimeout(() => {
+    infoFlushTimer = null;
+    if (!socket?.connected) { pendingInfoByMultipv.clear(); return; }
+    for (const p of pendingInfoByMultipv.values()) {
+      socket.emit('connector_analysis_update', p);
+    }
+    pendingInfoByMultipv.clear();
+  }, INFO_THROTTLE_MS);
 }
 
 function emitEngineSettings() {
@@ -242,13 +233,13 @@ function clearEngineIdleShutdown() {
 }
 
 function scheduleEngineIdleShutdown() {
-  if (!isOnDemandEngineMode(currentConfig) || !engineProcess) return;
+  if (!isOnDemandEngineMode(currentConfig) || !engine) return;
   clearEngineIdleShutdown();
   engineIdleShutdownTimer = setTimeout(async () => {
     engineIdleShutdownTimer = null;
-    if (!isOnDemandEngineMode(currentConfig) || isAnalyzing || isChangingOption || !engineProcess) return;
+    if (!isOnDemandEngineMode(currentConfig) || isAnalyzing || batchActive || !engine) return;
     log('省メモリモード: エンジンを停止してメモリを解放します');
-    await killEngineProcess();
+    await stopEngineProcess();
     sendStatus(buildStatus(!!socket?.connected, false));
   }, ENGINE_IDLE_SHUTDOWN_DELAY_MS);
 }
@@ -288,13 +279,12 @@ async function restartEngineWithConfig(config, reason) {
   if (reason) log(reason);
   isAnalyzing = false;
   const started = await startEngine(config);
-  if (started && wasAnalyzing && resumeSfen) {
+  if (started && engine && wasAnalyzing && resumeSfen) {
     lastSfen = resumeSfen;
     lastTurn = resumeTurn;
     isAnalyzing = true;
     log('解析を再開します');
-    safeWrite(`position sfen ${sanitizeUSI(resumeSfen)}\n`);
-    safeWrite('go infinite\n');
+    engine.analyze(resumeSfen);
   }
   return started;
 }
@@ -318,9 +308,9 @@ async function applyConfigUpdate(nextConfig, prevConfig) {
 
   if (engineConfigChanged) {
     if (isOnDemandEngineMode(nextConfig) && !isAnalyzing) {
-      if (engineProcess) {
+      if (engine) {
         log('設定を保存しました。省メモリモードのため、次回解析時に新しいエンジン設定で起動します');
-        await killEngineProcess();
+        await stopEngineProcess();
         sendStatus(buildStatus(!!socket?.connected, false));
       } else {
         log('設定を保存しました。次回解析時に新しいエンジン設定で起動します');
@@ -341,18 +331,18 @@ async function applyConfigUpdate(nextConfig, prevConfig) {
     } else {
       log('常駐モードを有効にしました');
       clearEngineIdleShutdown();
-      if (socket?.connected && !engineProcess) {
+      if (socket?.connected && !engine) {
         await startEngine(nextConfig);
       }
     }
     emitEngineSettings();
-    sendStatus(buildStatus(!!socket?.connected, !!engineProcess));
+    sendStatus(buildStatus());
     return { applied: true, engineModeChanged: true };
   }
 
   log('設定を保存しました');
   emitEngineSettings();
-  sendStatus(buildStatus(!!socket?.connected, !!engineProcess));
+  sendStatus(buildStatus());
   return { applied: true };
 }
 
@@ -367,7 +357,7 @@ function connectToServer(config) {
   }
 
   log('Linea Cloudに接続中...');
-  sendStatus(buildStatus(false, !!engineProcess));
+  sendStatus(buildStatus(false));
 
   socket = io(serverUrl, {
     auth: { type: 'connector', token: normalizedConfig.apiKey, ...getConnectorIdentity() }
@@ -375,10 +365,10 @@ function connectToServer(config) {
 
   socket.on('connect', () => {
     log(`接続成功 (ID: ${socket.id})`);
-    log(`[DIAG] エンジン状態: ${engineProcess ? 'running (PID: ' + engineProcess.pid + ')' : 'stopped'}`);
+    log(`[DIAG] エンジン状態: ${engine?.running ? 'running (PID: ' + engine.pid + ')' : 'stopped'}`);
     log(`[DIAG] 現在の設定: Threads=${normalizedConfig.engineOptions?.Threads || '未設定'}, MultiPV=${normalizedConfig.engineOptions?.MultiPV || '未設定'}, Mode=${getEngineMode(normalizedConfig)}`);
     socket.emit('connector_ready');
-    sendStatus(buildStatus(true, !!engineProcess));
+    sendStatus(buildStatus(true));
     if (isOnDemandEngineMode(normalizedConfig)) {
       log('省メモリモード: 解析開始時にエンジンを起動します');
     } else {
@@ -388,16 +378,18 @@ function connectToServer(config) {
 
   socket.on('connect_error', (err) => {
     log(`[DIAG] 接続エラー: ${err.message} (type: ${err.type || 'unknown'})`);
-    sendStatus(buildStatus(false, false));
+    sendStatus(buildStatus(false));
   });
 
   socket.on('disconnect', (reason) => {
-    log(`[DIAG] 切断 (reason: ${reason}, engineRunning: ${!!engineProcess})`);
+    log(`[DIAG] 切断 (reason: ${reason}, engineRunning: ${!!engine?.running})`);
     // 再接続後はサーバーが残りから再バッチするのでローカルキューは破棄。
     // batchActive はループ自身に落とさせる（ここで消すと再接続時に二重ループになる）
-    if (batchPreemptCurrent) batchPreemptCurrent();
     batchQueue = [];
-    sendStatus(buildStatus(false, !!engineProcess));
+    if (engine && batchActive && !isAnalyzing) {
+      engine.stop({ discardSearch: true });
+    }
+    sendStatus(buildStatus(false));
     if (reason === 'io server disconnect') {
       log('[DIAG] サーバー側切断 → 手動再接続を試行');
       socket.connect();
@@ -425,26 +417,19 @@ function connectToServer(config) {
   // --- 解析リクエスト ---
   socket.on('request_analysis', async (data) => {
     markActivity();
-    const { sfen, turn } = data;
-    if (isChangingOption) {
-      lastSfen = sfen;
-      lastTurn = turn;
-      return;
-    }
+    const { sfen, turn } = data || {};
     if (!sfen) return;
     lastSfen = sfen;
     lastTurn = turn;
-    // バッチ探索中なら破棄して後回し（対話解析優先）
-    if (batchPreemptCurrent) batchPreemptCurrent();
     clearEngineIdleShutdown();
     const requestSfen = sfen;
     const requestTurn = turn;
-    if (!engineProcess) {
+    if (!engine || !engine.running) {
       if (isOnDemandEngineMode(currentConfig)) {
         log('省メモリモード: 解析開始のためエンジンを起動します');
       }
       const started = await startEngine(currentConfig);
-      if (!started || !engineProcess) {
+      if (!started || !engine) {
         log('解析開始できません: エンジンが起動していません');
         return;
       }
@@ -452,25 +437,19 @@ function connectToServer(config) {
     }
     isAnalyzing = true;
     log('解析開始...');
-    safeWrite('stop\n');
-    safeWrite(`position sfen ${sanitizeUSI(sfen)}\n`);
-    safeWrite('go infinite\n');
+    // UsiEngine 内部で「予約+暗黙stop→bestmove後にposition/go」に直列化される。
+    // バッチのmovetime探索中なら結果は破棄され、ループが再キューする。
+    engine.analyze(sfen);
   });
 
   socket.on('stop_analysis', () => {
     markActivity();
-    if (isChangingOption) {
-      isAnalyzing = false;
-      scheduleEngineIdleShutdown();
-      return;
-    }
     log('解析停止');
     isAnalyzing = false;
-    // この stop はバッチ探索も止めてしまうので、先に現在の局面を退避する
-    if (batchPreemptCurrent) batchPreemptCurrent();
-    safeWrite('stop\n');
-    safeWrite('usinewgame\n');
-    safeWrite('isready\n');
+    if (engine) {
+      // discardSearch: バッチ探索が走っていた場合は結果を捨てさせる（ループが再キュー）
+      engine.stop({ discardSearch: true });
+    }
     scheduleEngineIdleShutdown();
   });
 
@@ -480,6 +459,7 @@ function connectToServer(config) {
     const positions = Array.isArray(data?.positions) ? data.positions : [];
     const jobId = typeof data?.jobId === 'string' ? data.jobId : '';
     if (!jobId || positions.length === 0) return;
+    stoppedBatchJobs.delete(jobId);
     // サーバーは 1 バッチずつしか送らないのでキューは丸ごと置き換え
     batchQueue = positions
       .filter((p) => p && typeof p.sfen === 'string' && p.sfen.length > 0)
@@ -506,52 +486,46 @@ function connectToServer(config) {
   socket.on('connector:analyze_stop', (data) => {
     markActivity();
     const jobId = typeof data?.jobId === 'string' ? data.jobId : null;
-    // 探索中の局面をいったんキューへ戻してから該当ジョブごと落とす
-    if (batchPreemptCurrent) batchPreemptCurrent();
     if (jobId) {
+      stoppedBatchJobs.add(jobId);
       batchQueue = batchQueue.filter((item) => item.jobId !== jobId);
     } else {
+      for (const item of batchQueue) stoppedBatchJobs.add(item.jobId);
+      if (batchJobId) stoppedBatchJobs.add(batchJobId);
       batchQueue = [];
     }
+    // Set が際限なく育たないように軽く刈る
+    if (stoppedBatchJobs.size > 50) {
+      for (const id of stoppedBatchJobs) {
+        stoppedBatchJobs.delete(id);
+        if (stoppedBatchJobs.size <= 25) break;
+      }
+    }
     // エンジンに残った探索を止める（対話解析 isAnalyzing 中はその探索を壊さない）
-    if (batchActive && !isAnalyzing) {
-      safeWrite('stop\n');
+    if (batchActive && engine && !isAnalyzing) {
+      engine.stop({ discardSearch: true });
     }
   });
 
   socket.on('reset_engine', async () => {
     markActivity();
-    if (!engineProcess) return;
-    if (batchPreemptCurrent) batchPreemptCurrent();
+    if (!engine || !engine.running) return;
     log('エンジンリセット');
     try {
       const wasAnalyzing = isAnalyzing;
-      if (wasAnalyzing) {
-        safeWrite('stop\n');
-        await waitForStop(engineProcess);
-      }
-      isAnalyzing = false;
-      safeWrite('usinewgame\n');
-      safeWrite('isready\n');
-      await waitForReady(engineProcess);
+      await engine.newGame();
       if (wasAnalyzing && lastSfen) {
-        isAnalyzing = true;
-        safeWrite(`position sfen ${sanitizeUSI(lastSfen)}\n`);
-        safeWrite('go infinite\n');
+        engine.analyze(lastSfen);
       }
     } catch (e) {
       log(`エンジンリセットエラー: ${e.message}`);
-      isAnalyzing = false;
     }
   });
 
   socket.on('set_engine_option', async (data) => {
     markActivity();
-    if (isChangingOption) {
-      log(`[DIAG] set_engine_option 拒否 (engineProcess: ${!!engineProcess}, isChangingOption: ${isChangingOption})`);
-      return;
-    }
-    const { name, value } = data;
+    const { name, value } = data || {};
+    if (typeof name !== 'string') return;
     const activeConfig = currentConfig || normalizedConfig;
     const oldValue = activeConfig.engineOptions?.[name];
     log(`[DIAG] オプション変更: ${name} = ${oldValue} → ${value} (ブラウザからの要求)`);
@@ -561,33 +535,23 @@ function connectToServer(config) {
     currentConfig = activeConfig;
     try { saveConfig(activeConfig); } catch (e) { log(`設定保存エラー: ${e.message}`); }
 
-    if (!engineProcess) {
+    if (!engine || !engine.running) {
       log('[DIAG] エンジン停止中のため、次回起動時にオプションを反映します');
       emitEngineSettings();
       return;
     }
 
-    // オプション変更は stop/setoption を書くので、バッチ探索中の局面は退避する
-    if (batchPreemptCurrent) batchPreemptCurrent();
-    setChangingOption(true);
-
     try {
       const wasAnalyzing = isAnalyzing;
-      if (wasAnalyzing) {
-        safeWrite('stop\n');
-        await waitForStop(engineProcess);
-      }
-      safeWrite(`setoption name ${sanitizeUSI(name)} value ${sanitizeUSI(value)}\n`);
-      safeWrite('isready\n');
-      await waitForReady(engineProcess);
+      // 探索中なら UsiEngine が stop→bestmove→setoption→isready を直列化する。
+      // バッチ探索は破棄され再キューされる。
+      await engine.setOptions({ [name]: value });
       if (wasAnalyzing && lastSfen) {
-        safeWrite(`position sfen ${sanitizeUSI(lastSfen)}\n`);
-        safeWrite('go infinite\n');
+        engine.analyze(lastSfen);
       }
     } catch (e) {
       log(`オプション変更エラー: ${e.message}`);
     } finally {
-      setChangingOption(false);
       // ★設定同期: 変更後の実際の値をブラウザへ通知
       emitEngineSettings();
     }
@@ -597,13 +561,10 @@ function connectToServer(config) {
 
 function disconnectFromServer() {
   clearEngineIdleShutdown();
-  if (batchPreemptCurrent) batchPreemptCurrent();
   batchQueue = [];
-  if (engineProcess) {
-    try { engineProcess.stdin.write('quit\n'); } catch (e) {}
-    engineProcess.kill();
-    engineProcess = null;
-  }
+  const e = engine;
+  engine = null;
+  if (e) e.quit();
   if (socket) {
     socket.disconnect();
     socket = null;
@@ -614,35 +575,14 @@ function disconnectFromServer() {
 }
 
 // --- エンジン起動 ---
-let engineStartPromise = null;
 
-// ★旧エンジンを安全に終了させる（quit → SIGTERM → 3秒後にフォースキル）
-function killEngineProcess() {
-  return new Promise((resolve) => {
-    clearEngineIdleShutdown();
-    if (!engineProcess) { resolve(); return; }
-
-    const proc = engineProcess;
-    engineProcess = null;
-
-    let settled = false;
-    const settle = () => { if (settled) return; settled = true; resolve(); };
-
-    // 3秒で強制終了（Windowsでは大きなプロセスの終了に時間がかかる）
-    const forceTimer = setTimeout(() => {
-      try { proc.kill('SIGKILL'); } catch {}
-      settle();
-    }, 3000);
-
-    proc.once('close', () => {
-      clearTimeout(forceTimer);
-      settle();
-    });
-
-    // USIプロトコルで正常終了を要求 → 1秒後にSIGTERM
-    try { proc.stdin.write('quit\n'); } catch {}
-    setTimeout(() => { try { proc.kill(); } catch {} }, 1000);
-  });
+// 旧エンジンを安全に終了させる（quit → SIGTERM → SIGKILL は UsiEngine 内で段階実行）
+function stopEngineProcess() {
+  const e = engine;
+  engine = null;
+  if (!e) return Promise.resolve();
+  clearEngineIdleShutdown();
+  return e.quit();
 }
 
 async function startEngine(config) {
@@ -654,8 +594,8 @@ async function startEngine(config) {
   engineStartPromise = (async () => {
     const normalizedConfig = normalizeConfig(config);
 
-    // ★修正: 旧エンジンの終了を待ってから新エンジンを起動（二重起動防止）
-    await killEngineProcess();
+    // 旧エンジンの終了を待ってから新エンジンを起動（二重起動防止）
+    await stopEngineProcess();
 
     const enginePath = normalizedConfig.enginePath;
 
@@ -667,99 +607,72 @@ async function startEngine(config) {
 
     log(`エンジン起動: ${path.basename(enginePath)}`);
     log(`[DIAG] 適用オプション: ${JSON.stringify(normalizedConfig.engineOptions || {})}`);
-    const proc = spawn(enginePath, [], { cwd: path.dirname(enginePath) });
-    engineProcess = proc;
 
-    proc.stdin.write('usi\n');
-    if (normalizedConfig.engineOptions) {
-      for (const [key, value] of Object.entries(normalizedConfig.engineOptions)) {
-        proc.stdin.write(`setoption name ${key} value ${value}\n`);
-      }
-    }
-    proc.stdin.write('isready\n');
-    proc.stdin.write('usinewgame\n');
-
-    // ★info行スロットリング: MultiPVごとに最新のみ150ms間隔で送信（NPS改善）
-    let pendingInfoLines = [];
-    let infoFlushTimer = null;
-    const INFO_THROTTLE_MS = 150;
-
-    proc.stdout.on('data', (chunk) => {
-      const lines = chunk.toString().split('\n');
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed === 'readyok') {
-          log('エンジン準備完了');
-          sendStatus(buildStatus(!!socket?.connected, true));
-        }
-        if (isAnalyzing && trimmed.startsWith('info') && trimmed.includes('score')) {
-          if (socket?.connected) {
-            pendingInfoLines.push({ info: trimmed, sfen: lastSfen, turn: lastTurn });
-
-            if (!infoFlushTimer) {
-              infoFlushTimer = setTimeout(() => {
-                // MultiPVごとに最新のinfoだけを送信
-                const latest = new Map();
-                for (const item of pendingInfoLines) {
-                  const mpvMatch = item.info.match(/multipv (\d+)/);
-                  const mpv = mpvMatch ? mpvMatch[1] : '1';
-                  latest.set(mpv, item);
-                }
-                for (const data of latest.values()) {
-                  socket.emit('connector_analysis_update', data);
-                }
-                pendingInfoLines = [];
-                infoFlushTimer = null;
-              }, INFO_THROTTLE_MS);
-            }
-          }
-        }
-      }
+    const e = new UsiEngine({
+      cmd: enginePath,
+      engineOptions: normalizedConfig.engineOptions || {},
+      log,
     });
+    engine = e;
 
-    proc.stderr.on('data', (data) => {
-      const msg = data.toString();
-      if (msg.includes('Error') || msg.includes('Failed') || msg.includes('cannot open')) {
-        log(`エンジンエラー: ${msg.trim()}`);
-      }
-    });
+    // 対話解析の info をブラウザへ（局面タグで古い info を落とす）
+    e.onInfo = ({ sfen, raw, parsed }) => {
+      if (!isAnalyzing || !socket?.connected) return;
+      if (sfen !== lastSfen) return;
+      if (parsed.scoreCP === undefined && parsed.scoreMate === undefined) return;
+      const multipv = parsed.multipv === undefined ? 1 : parsed.multipv;
+      queueAnalysisUpdate(multipv, { info: raw, sfen: lastSfen, turn: lastTurn });
+    };
 
-    proc.on('close', (code) => {
-      // ★ガード: 古いプロセスのハンドラが新プロセスの参照を上書きしないようにする
-      if (engineProcess !== proc) return;
-
-      log(`エンジン終了 (code: ${code})`);
-      engineProcess = null;
-      // ★デッドロック防止: エンジン終了時にフラグを強制リセット
-      setChangingOption(false);
+    e.onUnexpectedClose = ({ code, signal, reason }) => {
+      if (engine !== e) return;
+      engine = null;
+      log(`エンジン終了 (code: ${code}${signal ? `, signal: ${signal}` : ''}${reason ? `, ${reason}` : ''})`);
       const wasAnalyzing = isAnalyzing;
       isAnalyzing = false;
       sendStatus(buildStatus(!!socket?.connected, false));
 
-      // ★エンジン自動再起動（意図しないクラッシュ時）
-      const shouldRestart = currentConfig && socket?.connected && code !== 0 && code !== null &&
-        (!isOnDemandEngineMode(currentConfig) || wasAnalyzing);
-      if (shouldRestart) {
-        const now = Date.now();
-        engineRestartTimestamps = engineRestartTimestamps.filter(t => now - t < ENGINE_RESTART_WINDOW_MS);
-        if (engineRestartTimestamps.length < ENGINE_RESTART_LIMIT) {
-          engineRestartTimestamps.push(now);
-          log(`⚠️ エンジンがクラッシュしました。自動再起動します... (${engineRestartTimestamps.length}/${ENGINE_RESTART_LIMIT})`);
-          setTimeout(async () => {
-            const started = await startEngine(currentConfig);
-            if (started && wasAnalyzing && lastSfen) {
-              isAnalyzing = true;
-              safeWrite(`position sfen ${sanitizeUSI(lastSfen)}\n`);
-              safeWrite('go infinite\n');
-            }
-          }, 1000);
-        } else {
-          log('❌ エンジンの再起動回数が上限に達しました。手動で再接続してください。');
-        }
+      // ★エンジン自動再起動（意図しないクラッシュ・応答不能時）
+      const shouldRestart = currentConfig && socket?.connected &&
+        (!isOnDemandEngineMode(currentConfig) || wasAnalyzing || batchActive);
+      if (!shouldRestart) return;
+      const now = Date.now();
+      engineRestartTimestamps = engineRestartTimestamps.filter(t => now - t < ENGINE_RESTART_WINDOW_MS);
+      if (engineRestartTimestamps.length >= ENGINE_RESTART_LIMIT) {
+        log('❌ エンジンの再起動回数が上限に達しました。手動で再接続してください。');
+        return;
       }
-    });
+      engineRestartTimestamps.push(now);
+      log(`⚠️ エンジンが異常終了しました。自動再起動します... (${engineRestartTimestamps.length}/${ENGINE_RESTART_LIMIT})`);
+      setTimeout(async () => {
+        const started = await startEngine(currentConfig);
+        if (started && engine && wasAnalyzing && lastSfen) {
+          // 再起動後はハッシュが空の状態からの再解析になる（結果は新規探索として届く）
+          isAnalyzing = true;
+          engine.analyze(lastSfen);
+        }
+      }, 1000);
+    };
 
-    return true;
+    try {
+      const res = await e.launch();
+      if (engine !== e) return false; // 起動待ちの間に破棄された
+      log(`エンジン準備完了: ${res.id.name || path.basename(enginePath)}`);
+      if (res.report.skipped.length > 0) {
+        log(`未対応オプションをスキップ: ${res.report.skipped.map((s) => s.name).join(', ')}`);
+      }
+      for (const c of res.report.clamped) {
+        log(`オプション ${c.name} を ${c.from} → ${c.to} に制限（エンジン宣言の範囲）`);
+      }
+      sendStatus(buildStatus(!!socket?.connected, true));
+      return true;
+    } catch (err) {
+      log(`エンジン起動失敗: ${err.message}`);
+      if (engine === e) engine = null;
+      e.quit();
+      sendStatus(buildStatus(!!socket?.connected, false));
+      return false;
+    }
   })();
 
   try {
@@ -781,19 +694,15 @@ function startBatchLoop() {
       }
       // 対話解析を優先
       if (isAnalyzing) {
-        await new Promise((r) => setTimeout(r, 1000));
+        await sleep(1000);
         continue;
       }
-      if (isChangingOption) {
-        await new Promise((r) => setTimeout(r, 500));
-        continue;
-      }
-      if (!engineProcess) {
+      if (!engine || !engine.running) {
         if (isOnDemandEngineMode(currentConfig)) {
           log('省メモリモード: バッチ解析のためエンジンを起動します');
         }
         const started = await startEngine(currentConfig);
-        if (!started || !engineProcess) {
+        if (!started || !engine) {
           log('バッチ解析を中止: エンジンが起動していません');
           batchQueue = [];
           break;
@@ -802,7 +711,33 @@ function startBatchLoop() {
       clearEngineIdleShutdown();
       const item = batchQueue.shift();
       if (!item) break;
-      await analyzeBatchPosition(item);
+
+      const res = await engine.search(item.sfen, batchSecondsPerMove * 1000);
+      if (res.status === 'done') {
+        if (socket?.connected) {
+          const payload = { jobId: item.jobId, sfen: item.sfen };
+          const lp = res.lastParsed;
+          if (lp) {
+            if (lp.scoreMate !== undefined) payload.scoreMate = lp.scoreMate;
+            else if (lp.scoreCP !== undefined) payload.scoreCp = lp.scoreCP;
+          }
+          if (res.bestmove && res.bestmove !== 'resign' && res.bestmove !== 'win') {
+            payload.bestMove = res.bestmove;
+          }
+          socket.emit('connector:analysis_result', payload);
+          batchJobDone += 1;
+          // 10 局面ごと・ジョブ完走時にジョブ全体の進捗を出す
+          if (batchJobDone % 10 === 0 || batchJobDone === batchJobTotal) {
+            log(`バッチ解析: ${batchJobDone}/${batchJobTotal || '?'} 局面完了`);
+          }
+        }
+      } else {
+        // preempted: 対話解析・切断・エンジン再起動などで破棄された → 再キュー
+        if (!stoppedBatchJobs.has(item.jobId)) {
+          batchQueue.unshift(item);
+        }
+        await sleep(200);
+      }
     }
     batchActive = false;
     scheduleEngineIdleShutdown();
@@ -811,148 +746,6 @@ function startBatchLoop() {
     batchActive = false;
     batchQueue = [];
     scheduleEngineIdleShutdown();
-  });
-}
-
-function analyzeBatchPosition({ jobId, sfen }) {
-  return new Promise((resolve) => {
-    const proc = engineProcess;
-    if (!proc || !socket?.connected) {
-      resolve();
-      return;
-    }
-
-    const movetimeMs = batchSecondsPerMove * 1000;
-    let lastScoreInfo = null;
-    let settled = false;
-
-    const cleanup = () => {
-      if (batchPreemptCurrent === preempt) batchPreemptCurrent = null;
-      proc.stdout.off('data', onData);
-    };
-
-    const finish = (payload) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (payload && socket?.connected) {
-        socket.emit('connector:analysis_result', payload);
-        batchJobDone += 1;
-        // 10 局面ごと・ジョブ完走時にジョブ全体の進捗を出す
-        // （ローカルキューは現在バッチの残りでしかないため表示しない）
-        if (batchJobDone % 10 === 0 || batchJobDone === batchJobTotal) {
-          log(`バッチ解析: ${batchJobDone}/${batchJobTotal || '?'} 局面完了`);
-        }
-      }
-      resolve();
-    };
-
-    // 対話解析などに横取りされたら結果を破棄してキュー先頭へ戻す。
-    // 呼び出し元（request_analysis / stop_analysis / reset_engine /
-    // set_engine_option / analyze_stop / disconnect）が engine に書く前に呼ぶ。
-    // ここでは stop を書かない: 直後に対話解析の go infinite が始まっている
-    // 可能性があり、書くとその探索まで止めてしまう。
-    const preempt = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      batchQueue.unshift({ jobId, sfen });
-      resolve();
-    };
-    batchPreemptCurrent = preempt;
-
-    const buildPayload = () => {
-      const payload = { jobId, sfen };
-      if (lastScoreInfo) {
-        const mateMatch = lastScoreInfo.match(/score mate (-?\d+)/);
-        const cpMatch = lastScoreInfo.match(/score cp (-?\d+)/);
-        if (mateMatch) payload.scoreMate = parseInt(mateMatch[1], 10);
-        else if (cpMatch) payload.scoreCp = parseInt(cpMatch[1], 10);
-      }
-      return payload;
-    };
-
-    const onData = (chunk) => {
-      for (const line of chunk.toString().split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        if (trimmed.startsWith('info') && trimmed.includes('score')) {
-          // multipv 1（または multipv 無し）の最新だけ保持
-          const mpvMatch = trimmed.match(/multipv (\d+)/);
-          const mpv = mpvMatch ? parseInt(mpvMatch[1], 10) : 1;
-          if (mpv === 1) lastScoreInfo = trimmed;
-        }
-        if (trimmed.startsWith('bestmove')) {
-          // フック経由を通らずに対話解析が始まっていたら、
-          // この bestmove は途中打ち切りの低品質値なので捨てて再キューする
-          if (isAnalyzing) {
-            preempt();
-            return;
-          }
-          const moveToken = trimmed.split(/\s+/)[1] || '';
-          const payload = buildPayload();
-          if (moveToken && moveToken !== 'resign' && moveToken !== 'win') {
-            payload.bestMove = moveToken;
-          }
-          finish(payload);
-          return;
-        }
-      }
-    };
-
-    proc.stdout.on('data', onData);
-
-    safeWrite(`position sfen ${sanitizeUSI(sfen)}\n`);
-    safeWrite(`go movetime ${movetimeMs}\n`);
-
-    const timeoutMs = movetimeMs + 15_000;
-    setTimeout(() => {
-      if (settled) return;
-      if (isAnalyzing) {
-        // 対話解析中に stop を書くとその探索を壊すので、破棄して再キュー
-        preempt();
-        return;
-      }
-      safeWrite('stop\n');
-      setTimeout(() => {
-        if (settled) return;
-        // タイムアウト時も最後の score があれば返す
-        if (lastScoreInfo) {
-          finish(buildPayload());
-        } else {
-          finish(null);
-        }
-      }, 2000);
-    }, timeoutMs);
-  });
-}
-
-// --- 補助関数 ---
-function waitForStop(proc) {
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => { proc.stdout.off('data', listener); resolve(); }, 1000);
-    const listener = (data) => {
-      for (const line of data.toString().split('\n')) {
-        if (line.trim().startsWith('bestmove') || line.trim().includes('depth 0')) {
-          clearTimeout(timeout); proc.stdout.off('data', listener); resolve(); return;
-        }
-      }
-    };
-    proc.stdout.on('data', listener);
-  });
-}
-
-function waitForReady(proc) {
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => { proc.stdout.off('data', listener); log('readyokタイムアウト'); resolve(); }, 5000);
-    const listener = (data) => {
-      for (const line of data.toString().split('\n')) {
-        if (line.trim() === 'readyok') {
-          clearTimeout(timeout); proc.stdout.off('data', listener); resolve(); return;
-        }
-      }
-    };
-    proc.stdout.on('data', listener);
   });
 }
 
@@ -981,7 +774,7 @@ function setupIPC() {
     const result = await dialog.showOpenDialog(mainWindow, {
       title: 'エンジンを選択',
       filters: [
-        { name: '実行ファイル', extensions: ['exe'] },
+        { name: '実行ファイル', extensions: ['exe', 'bat', 'cmd'] },
         { name: 'すべてのファイル', extensions: ['*'] }
       ],
       properties: ['openFile']
@@ -992,7 +785,7 @@ function setupIPC() {
 
   ipcMain.handle('check-eval-files', (_, enginePath) => {
     try {
-      if (!enginePath || !enginePath.endsWith('.exe')) return { ok: false, files: [] };
+      if (!enginePath || !/\.(exe|bat|cmd)$/i.test(enginePath)) return { ok: false, files: [] };
       const dir = path.dirname(enginePath.replace(/\//g, path.sep));
       const files = fs.readdirSync(dir);
       // NNUE系: nn.bin, *.nnue, nn*.bin
@@ -1042,6 +835,11 @@ function setupIPC() {
     markActivity();
     disconnectFromServer();
     return true;
+  });
+
+  // ★USI通信ログ（直近100件のリングバッファ）
+  ipcMain.handle('get-usi-history', () => {
+    return engine ? engine.getHistoryText() : '';
   });
 
   // --- 自動アップデート ---
@@ -1198,7 +996,7 @@ function canInstallDownloadedUpdate() {
   return updateReadyToInstall
     && idleMs >= UPDATE_IDLE_INSTALL_DELAY_MS
     && !isAnalyzing
-    && !isChangingOption;
+    && !batchActive;
 }
 
 function scheduleIdleUpdateInstall() {

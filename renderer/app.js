@@ -68,7 +68,7 @@
           Threads: parseInt($('#wizard-threads').value, 10) || 4,
           USI_Hash: parseInt($('#wizard-hash').value, 10) || 1024,
           MultiPV: parseInt($('#wizard-multipv').value, 10) || 3,
-          fv_scale: parseInt($('#wizard-fvscale').value, 10) || 24,
+          FV_SCALE: parseInt($('#wizard-fvscale').value, 10) || 24,
         }
       };
       await window.connector.saveConfig(newConfig);
@@ -120,7 +120,7 @@
     $('#cfg-threads').value = opts.Threads || 4;
     $('#cfg-hash').value = opts.USI_Hash || 1024;
     $('#cfg-multipv').value = opts.MultiPV || 3;
-    $('#cfg-fvscale').value = opts.fv_scale || 24;
+    $('#cfg-fvscale').value = opts.FV_SCALE || opts.fv_scale || 24;
     $('#cfg-engine-ondemand').checked = cfg.engineMode === ENGINE_MODE_ON_DEMAND;
 
     if (cfg.enginePath) {
@@ -170,7 +170,7 @@
           Threads: threads,
           USI_Hash: hash,
           MultiPV: parseInt($('#cfg-multipv').value, 10) || 3,
-          fv_scale: parseInt($('#cfg-fvscale').value, 10) || 24,
+          FV_SCALE: parseInt($('#cfg-fvscale').value, 10) || 24,
         }
       };
       const result = await window.connector.saveConfig(updated);
@@ -241,6 +241,23 @@
       container.removeChild(container.firstChild);
     }
   }
+
+  // ★USI通信ログコピー（エンジンとの生のやりとり直近100件）
+  $('#btn-copy-usi').addEventListener('click', async () => {
+    const btn = $('#btn-copy-usi');
+    const text = await window.connector.getUsiHistory();
+    if (!text) {
+      addLog('USI通信ログはまだありません（エンジン起動後に記録されます）');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      btn.textContent = '✅ コピー済み';
+      setTimeout(() => { btn.textContent = '⚙ USI通信'; }, 2000);
+    } catch {
+      addLog('USI通信ログのコピーに失敗しました');
+    }
+  });
 
   // ★ログコピー機能
   $('#btn-copy-log').addEventListener('click', async () => {
