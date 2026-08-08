@@ -617,12 +617,15 @@ async function startEngine(config) {
     engine = e;
 
     // 対話解析の info をブラウザへ（局面タグで古い info を落とす）
+    // v2: 構造化済みフィールド（depth/seldepth/timeMs/nodes/nps/hashfullPerMill/
+    //     multipv/scoreCP/scoreMate/lowerbound/upperbound/pv[]）。
+    //     info(生文字列)は旧クライアント互換のため残す。サーバーは素通しする。
     e.onInfo = ({ sfen, raw, parsed }) => {
       if (!isAnalyzing || !socket?.connected) return;
       if (sfen !== lastSfen) return;
       if (parsed.scoreCP === undefined && parsed.scoreMate === undefined) return;
       const multipv = parsed.multipv === undefined ? 1 : parsed.multipv;
-      queueAnalysisUpdate(multipv, { info: raw, sfen: lastSfen, turn: lastTurn });
+      queueAnalysisUpdate(multipv, { info: raw, sfen: lastSfen, turn: lastTurn, v2: parsed });
     };
 
     e.onUnexpectedClose = ({ code, signal, reason }) => {

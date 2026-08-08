@@ -96,6 +96,12 @@ test('E2E: request_analysis / batch / set_engine_option / reset_engine の全経
     assert.equal(upd.data.sfen, STARTPOS);
     assert.equal(upd.data.turn, 'b');
     assert.ok(String(upd.data.info).startsWith('info '), `info行が生で届く: ${upd.data.info}`);
+    // v2構造化フィールド(Phase B): 旧クライアント互換のためinfoと並存する
+    assert.ok(upd.data.v2, 'v2フィールドが載る');
+    assert.equal(typeof upd.data.v2.depth, 'number');
+    assert.equal(typeof upd.data.v2.scoreCP, 'number');
+    assert.ok(Array.isArray(upd.data.v2.pv) && upd.data.v2.pv.length > 0);
+    assert.equal(typeof upd.data.v2.nps, 'number');
 
     // 対話解析中に届いたバッチは待たされる
     connSocket.emit('connector:analyze_batch', {
