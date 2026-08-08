@@ -99,8 +99,9 @@ function buildStatus(connected = !!socket?.connected, engineRunning = !!(engine 
 
 // --- 設定ファイル ---
 // Electron標準の userData (%APPDATA%\linea-connector) を使用
+// LINEA_CONNECTOR_CONFIG_DIR はE2Eテスト・サポート診断用の上書き
 function getConfigPath() {
-  const dir = app.getPath('userData');
+  const dir = process.env.LINEA_CONNECTOR_CONFIG_DIR || app.getPath('userData');
   return path.join(dir, 'config.json');
 }
 
@@ -867,6 +868,7 @@ function createWindow() {
     minWidth: 420,
     minHeight: 520,
     resizable: true,
+    show: !process.env.LINEA_CONNECTOR_HIDDEN,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -901,6 +903,7 @@ app.on('before-quit', () => {
 
 // --- 自動アップデート ---
 function setupAutoUpdater() {
+  if (process.env.LINEA_CONNECTOR_TEST) return; // E2Eテスト中はGitHubへ行かない
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
 

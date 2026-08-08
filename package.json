@@ -7,7 +7,9 @@
   "scripts": {
     "start": "electron .",
     "build": "electron-builder --config electron-builder.config.cjs --win",
-    "test": "node --test test/usi-engine.test.js"
+    "test": "node --test test/usi-engine.test.js",
+    "test:e2e": "node --test test/integration.test.js",
+    "test:all": "node --test test/usi-engine.test.js test/integration.test.js"
   },
   "dependencies": {
     "electron-updater": "^6.1.0",
@@ -17,6 +19,7 @@
     "7zip-bin": "^5.2.0",
     "electron": "41.3.0",
     "electron-builder": "^26.8.1",
-    "rcedit": "^5.0.2"
+    "rcedit": "^5.0.2",
+    "socket.io": "^4.8.3"
   }
 }
