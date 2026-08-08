@@ -6,7 +6,8 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder --config electron-builder.config.cjs --win"
+    "build": "electron-builder --config electron-builder.config.cjs --win",
+    "test": "node --test test/usi-engine.test.js"
   },
   "dependencies": {
     "electron-updater": "^6.1.0",
