@@ -58,10 +58,22 @@ test('E2E: request_analysis / batch / set_engine_option / reset_engine の全経
     }
   });
 
+  // 定跡フィクスチャ(STARTPOS のみ収録)
+  const bookPath = path.join(tmp, 'test-book.db');
+  fs.writeFileSync(bookPath, [
+    '#YANEURAOU-DB2016 1.00',
+    `sfen ${STARTPOS}`,
+    '2g2f 3c3d 63 27 935',
+    '7g7f none 20 25 600',
+    '',
+  ].join('\n'));
+
   fs.writeFileSync(path.join(tmp, 'config.json'), JSON.stringify({
     serverUrl: `http://127.0.0.1:${port}`,
     apiKey: 'sk_live_' + '0'.repeat(48),
     enginePath: batPath.replace(/\\/g, '/'),
+    bookPath: bookPath.replace(/\\/g, '/'),
+    useBook: false,
     engineMode: 'always',
     engineOptions: { Threads: 2, MultiPV: 1, USI_Hash: 16 },
   }, null, 2));
@@ -137,6 +149,49 @@ test('E2E: request_analysis / batch / set_engine_option / reset_engine の全経
     await waitEvent(
       () => countOf('connector_analysis_update', (e) => e.data.sfen === POS_A) > before + 2,
       15000, 'analysis resumes after reset');
+
+    // --- 定跡フロー ---
+    // UseBook ON → 設定同期に定跡状態が載る
+    connSocket.emit('set_engine_option', { name: 'UseBook', value: 'true' });
+    await waitEvent(
+      (e) => e.name === 'connector_engine_settings' && e.data?.UseBook === true && e.data?.bookStatus === 'ok',
+      10000, 'UseBook sync with book ok');
+
+    // 定跡ヒット局面 → 候補手がMultiPV行として届く(エンジンではなく定跡から)
+    const beforeBook = events.length;
+    connSocket.emit('request_analysis', { sfen: STARTPOS, turn: 'b' });
+    const bookRow = await waitEvent(
+      (e, i) => e.name === 'connector_analysis_update' && e.data?.v2?.book === true,
+      10000, 'book move rows');
+    assert.equal(bookRow.data.sfen, STARTPOS);
+    await waitEvent(
+      () => countOf('connector_analysis_update', (e) => e.data?.v2?.book === true) >= 2,
+      5000, 'both book rows');
+    const bookRows = events.slice(beforeBook)
+      .filter((e) => e.name === 'connector_analysis_update' && e.data?.v2?.book === true)
+      .map((e) => e.data);
+    const row1 = bookRows.find((r) => r.v2.multipv === 1);
+    const row2 = bookRows.find((r) => r.v2.multipv === 2);
+    assert.deepEqual(row1.v2.pv, ['2g2f', '3c3d']);
+    assert.equal(row1.v2.scoreCP, 63);
+    assert.equal(row1.v2.bookCount, 935);
+    assert.deepEqual(row2.v2.pv, ['7g7f']);
+    assert.ok(String(row1.info).includes('score cp 63'), '旧クライアント互換のinfo行');
+
+    // 定跡外の局面 → 通常のエンジン解析に戻る
+    const beforeEngine = events.length;
+    connSocket.emit('request_analysis', { sfen: POS_B, turn: 'b' });
+    const engineRow = await waitEvent(
+      (e) => e.name === 'connector_analysis_update' && e.data?.sfen === POS_B && !e.data?.v2?.book,
+      15000, 'engine analysis resumes off-book');
+    assert.equal(typeof engineRow.data.v2.depth, 'number');
+    void beforeEngine;
+
+    // UseBook OFF → 同期が返る
+    connSocket.emit('set_engine_option', { name: 'UseBook', value: 'false' });
+    await waitEvent(
+      (e) => e.name === 'connector_engine_settings' && e.data?.UseBook === false,
+      10000, 'UseBook off sync');
 
     // 最後にもう一度停止(後片付け)
     connSocket.emit('stop_analysis', {});

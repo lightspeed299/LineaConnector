@@ -8,6 +8,7 @@ module.exports = {
   files: [
     'main.js',
     'usi-engine.js',
+    'book.js',
     'preload.js',
     'renderer/**/*',
     'assets/**/*',

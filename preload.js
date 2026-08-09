@@ -12,6 +12,9 @@ contextBridge.exposeInMainWorld('connector', {
   selectEngineFile: () => ipcRenderer.invoke('select-engine-file'),
   checkEvalFiles: (enginePath) => ipcRenderer.invoke('check-eval-files', enginePath),
 
+  // 定跡ファイル選択
+  selectBookFile: () => ipcRenderer.invoke('select-book-file'),
+
   // 接続制御
   connect: (config) => ipcRenderer.invoke('connect', config),
   disconnect: () => ipcRenderer.invoke('disconnect'),

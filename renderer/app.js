@@ -116,6 +116,7 @@
   function populateSettings(cfg) {
     $('#cfg-apikey').value = cfg.apiKey || '';
     $('#cfg-engine').value = cfg.enginePath || '';
+    $('#cfg-book').value = cfg.bookPath || '';
     const opts = cfg.engineOptions || {};
     $('#cfg-threads').value = opts.Threads || 4;
     $('#cfg-hash').value = opts.USI_Hash || 1024;
@@ -155,6 +156,21 @@
       }
     });
 
+    // Book select / clear
+    $('#btn-select-book').addEventListener('click', async () => {
+      const filePath = await window.connector.selectBookFile();
+      if (filePath) {
+        $('#cfg-book').value = filePath;
+        addLog('定跡ファイルを選択しました。「設定を保存」で反映されます');
+      }
+    });
+    $('#btn-clear-book').addEventListener('click', () => {
+      if ($('#cfg-book').value) {
+        $('#cfg-book').value = '';
+        addLog('定跡設定を解除しました。「設定を保存」で反映されます');
+      }
+    });
+
     // Save
     $('#btn-save').addEventListener('click', async () => {
       let threads = parseInt($('#cfg-threads').value, 10) || 4;
@@ -165,6 +181,8 @@
         serverUrl: activeConfig.serverUrl || DEFAULT_SERVER_URL,
         apiKey: $('#cfg-apikey').value,
         enginePath: $('#cfg-engine').value,
+        bookPath: $('#cfg-book').value,
+        useBook: activeConfig.useBook === true,
         engineMode: $('#cfg-engine-ondemand').checked ? ENGINE_MODE_ON_DEMAND : ENGINE_MODE_ALWAYS,
         engineOptions: {
           Threads: threads,

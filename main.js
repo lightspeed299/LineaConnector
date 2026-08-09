@@ -6,6 +6,7 @@ const os = require('os');
 const io = require('socket.io-client');
 const { autoUpdater } = require('electron-updater');
 const { UsiEngine } = require('./usi-engine');
+const { YaneBook } = require('./book');
 
 const CURRENT_VERSION = `v${require('./package.json').version}`;
 const DEFAULT_SERVER_URL = 'https://api.lineashogi.com';
@@ -78,6 +79,8 @@ function normalizeConfig(config) {
     serverUrl: normalizeServerUrl(config?.serverUrl),
     engineMode: getEngineMode(config),
     engineOptions: normalizeEngineOptions(config?.engineOptions),
+    bookPath: String(config?.bookPath || ''),
+    useBook: config?.useBook === true || config?.useBook === 'true',
   };
 }
 
@@ -194,6 +197,70 @@ function markActivity() {
   lastActivityAt = Date.now();
 }
 
+// --- 定跡 (やねうら王 .db) ---
+let book = null;            // YaneBook | null
+let bookLoadedPath = null;  // 現在開いているファイル(エラー時は 'error:'+path)
+let bookLoadPromise = null;
+
+async function ensureBook(config = currentConfig) {
+  const bookPath = String(config?.bookPath || '');
+  if (!bookPath) {
+    if (book) await closeBook();
+    bookLoadedPath = null;
+    return null;
+  }
+  if (book && bookLoadedPath === bookPath) return book;
+  if (bookLoadPromise) return bookLoadPromise;
+  bookLoadPromise = (async () => {
+    if (book) await closeBook();
+    if (!fs.existsSync(bookPath)) {
+      log(`定跡ファイルが見つかりません: ${bookPath}`);
+      bookLoadedPath = `error:${bookPath}`;
+      return null;
+    }
+    try {
+      const opened = await YaneBook.open(bookPath);
+      book = opened;
+      bookLoadedPath = bookPath;
+      log(`定跡を読み込みました: ${path.basename(bookPath)} (${opened.mode === 'in-memory' ? `${opened.entryCount}局面` : '大容量モード'})`);
+      return opened;
+    } catch (e) {
+      log(`定跡の読み込みに失敗: ${e.message}`);
+      bookLoadedPath = `error:${bookPath}`;
+      return null;
+    }
+  })();
+  try {
+    return await bookLoadPromise;
+  } finally {
+    bookLoadPromise = null;
+  }
+}
+
+function closeBook() {
+  const b = book;
+  book = null;
+  bookLoadedPath = null;
+  return b ? b.close() : Promise.resolve();
+}
+
+function bookStatusForSync() {
+  const bookPath = String(currentConfig?.bookPath || '');
+  if (!bookPath) return { bookFile: null, bookStatus: null };
+  if (book && bookLoadedPath === bookPath) {
+    return {
+      bookFile: path.basename(bookPath),
+      bookStatus: 'ok',
+      bookMode: book.mode,
+      bookEntries: book.mode === 'in-memory' ? book.entryCount : undefined,
+    };
+  }
+  if (bookLoadedPath === `error:${bookPath}`) {
+    return { bookFile: path.basename(bookPath), bookStatus: 'error' };
+  }
+  return { bookFile: path.basename(bookPath), bookStatus: 'loading' };
+}
+
 // ★エンジン自動再起動（クラッシュ時）: 1分間に最大3回まで
 const ENGINE_RESTART_LIMIT = 3;
 const ENGINE_RESTART_WINDOW_MS = 60 * 1000;
@@ -203,6 +270,35 @@ let engineRestartTimestamps = [];
 const INFO_THROTTLE_MS = 150;
 const pendingInfoByMultipv = new Map(); // multipv -> payload
 let infoFlushTimer = null;
+
+// 定跡候補手を MultiPV 形式の解析行として送出する(ShogiHome usi.ts:204-220 と同じマッピング:
+// multipv=順位・scoreCP←評価値・nodes←採用数・pv←[手,応手])。既存の候補手UIがそのまま使われる。
+function emitBookMoves(sfen, turn, bookMoves) {
+  if (!socket?.connected) return;
+  const limit = Math.min(bookMoves.length, 10);
+  log(`定跡ヒット: ${bookMoves.length}手 (${path.basename(currentConfig?.bookPath || '')})`);
+  for (let i = 0; i < limit; i++) {
+    const m = bookMoves[i];
+    const pv = m.usi2 ? [m.usi, m.usi2] : [m.usi];
+    const v2 = {
+      multipv: i + 1,
+      pv,
+      currmove: m.usi,
+      book: true,
+    };
+    if (typeof m.score === 'number') v2.scoreCP = Math.round(m.score);
+    if (typeof m.depth === 'number') v2.depth = m.depth;
+    if (typeof m.count === 'number') { v2.nodes = m.count; v2.bookCount = m.count; }
+    // 旧クライアント互換の生info行(scoreが無い手は旧クライアントでは表示されない)
+    const infoParts = ['info'];
+    if (v2.depth !== undefined) infoParts.push(`depth ${v2.depth}`);
+    if (v2.scoreCP !== undefined) infoParts.push(`score cp ${v2.scoreCP}`);
+    infoParts.push(`multipv ${i + 1}`);
+    if (v2.nodes !== undefined) infoParts.push(`nodes ${v2.nodes}`);
+    infoParts.push(`pv ${pv.join(' ')}`);
+    socket.emit('connector_analysis_update', { info: infoParts.join(' '), sfen, turn, v2 });
+  }
+}
 
 function queueAnalysisUpdate(multipv, payload) {
   pendingInfoByMultipv.set(multipv, payload);
@@ -222,6 +318,9 @@ function emitEngineSettings() {
     socket.emit('connector_engine_settings', {
       Threads: currentConfig.engineOptions.Threads,
       MultiPV: currentConfig.engineOptions.MultiPV,
+      // 定跡設定(v6.1.0〜)。サーバーは素通し・旧クライアントは未知フィールドを無視する
+      UseBook: !!currentConfig.useBook,
+      ...bookStatusForSync(),
     });
   }
 }
@@ -292,6 +391,11 @@ async function restartEngineWithConfig(config, reason) {
 
 async function applyConfigUpdate(nextConfig, prevConfig) {
   currentConfig = nextConfig;
+
+  // 定跡ファイルの変更はエンジンと独立に反映する(解除なら閉じる・変更なら開き直す)
+  if (String(prevConfig?.bookPath || '') !== String(nextConfig.bookPath || '')) {
+    void ensureBook(nextConfig).then(() => emitEngineSettings());
+  }
 
   if (!socket) {
     return { applied: false, reason: 'not_connected' };
@@ -375,6 +479,10 @@ function connectToServer(config) {
     } else {
       startEngine(normalizedConfig);
     }
+    // 定跡利用が有効なら事前に読み込んでおく(無効なら初回リクエスト時に遅延ロード)
+    if (normalizedConfig.useBook && normalizedConfig.bookPath) {
+      void ensureBook(normalizedConfig).then(() => emitEngineSettings());
+    }
   });
 
   socket.on('connect_error', (err) => {
@@ -425,6 +533,32 @@ function connectToServer(config) {
     clearEngineIdleShutdown();
     const requestSfen = sfen;
     const requestTurn = turn;
+
+    // ★定跡: 「定跡を利用」ON でヒットしたら、エンジンを回さず候補手を返す
+    //   (ShogiHome の searchBook と同じ発想。手を進めて定跡を外れたら自動でエンジンへ)
+    if (currentConfig?.useBook && currentConfig?.bookPath) {
+      try {
+        const b = await ensureBook(currentConfig);
+        if (lastSfen !== requestSfen || lastTurn !== requestTurn) return;
+        if (b) {
+          const bookMoves = await b.searchMoves(sfen);
+          if (lastSfen !== requestSfen || lastTurn !== requestTurn) return;
+          if (bookMoves.length > 0) {
+            // 対話解析セッションとしては扱わない(エンジンは止め、バッチには道を譲る)
+            if (isAnalyzing) {
+              isAnalyzing = false;
+              if (engine) engine.stop();
+            }
+            emitBookMoves(requestSfen, requestTurn, bookMoves);
+            scheduleEngineIdleShutdown();
+            return;
+          }
+        }
+      } catch (e) {
+        log(`定跡検索エラー: ${e.message}`);
+      }
+    }
+
     if (!engine || !engine.running) {
       if (isOnDemandEngineMode(currentConfig)) {
         log('省メモリモード: 解析開始のためエンジンを起動します');
@@ -527,6 +661,24 @@ function connectToServer(config) {
     markActivity();
     const { name, value } = data || {};
     if (typeof name !== 'string') return;
+
+    // ★UseBook はエンジンオプションではなく Connector 側の疑似オプション。
+    //   エンジンへは送らず、設定として保存して同期だけ返す
+    if (name === 'UseBook') {
+      const useBook = String(value) === 'true';
+      const cfg = currentConfig || normalizedConfig;
+      cfg.useBook = useBook;
+      currentConfig = cfg;
+      try { saveConfig(cfg); } catch (e) { log(`設定保存エラー: ${e.message}`); }
+      log(`定跡利用を${useBook ? '有効' : '無効'}にしました`);
+      emitEngineSettings();
+      // 読み込み完了後にもう一度同期(loading→ok/errorの反映)
+      if (useBook && cfg.bookPath) {
+        void ensureBook(cfg).then(() => emitEngineSettings());
+      }
+      return;
+    }
+
     const activeConfig = currentConfig || normalizedConfig;
     const oldValue = activeConfig.engineOptions?.[name];
     log(`[DIAG] オプション変更: ${name} = ${oldValue} → ${value} (ブラウザからの要求)`);
@@ -563,6 +715,7 @@ function connectToServer(config) {
 function disconnectFromServer() {
   clearEngineIdleShutdown();
   batchQueue = [];
+  void closeBook();
   const e = engine;
   engine = null;
   if (e) e.quit();
@@ -827,6 +980,20 @@ function setupIPC() {
     } catch (e) {
       return { ok: false, error: e.message, files: [] };
     }
+  });
+
+  // 定跡ファイル選択
+  ipcMain.handle('select-book-file', async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: '定跡ファイルを選択（やねうら王 .db 形式）',
+      filters: [
+        { name: '定跡DB (やねうら王形式)', extensions: ['db'] },
+        { name: 'すべてのファイル', extensions: ['*'] }
+      ],
+      properties: ['openFile']
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0].replace(/\\/g, '/');
   });
 
   ipcMain.handle('connect', (_, config) => {
