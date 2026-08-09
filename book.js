@@ -331,4 +331,104 @@ async function loadInMemory(path) {
   return entries;
 }
 
-module.exports = { YaneBook, normalizeQuerySfen, parseMoveLine, DEFAULT_ON_THE_FLY_THRESHOLD_MB };
+// ---- 盤面180°反転 (FlippedBook 相当) ----
+// ShogiHome src/common/helpers/sfen.ts の移植。正規化済みSFEN専用。
+
+function flippedSFEN(sfen) {
+  const sections = sfen.split(' ');
+  // 盤: 逆順に走査しつつ大小反転(+は直前へ付け直す)
+  const board = [];
+  for (let i = sections[0].length - 1; i >= 0; i--) {
+    let c = sections[0][i];
+    c = c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase();
+    if (i > 0 && sections[0][i - 1] === '+') {
+      board.push('+');
+      i--;
+    }
+    board.push(c);
+  }
+  sections[0] = board.join('');
+  // 手番
+  sections[1] = sections[1] === 'b' ? 'w' : 'b';
+  // 持ち駒: 先手部(大文字列)と後手部(小文字列)を入れ替えて大小反転
+  if (sections[2] !== '-') {
+    let blackHandLength = sections[2].length;
+    for (; blackHandLength >= 1; blackHandLength--) {
+      const char = sections[2][blackHandLength - 1];
+      if (char !== char.toLowerCase()) break;
+    }
+    sections[2] =
+      sections[2].slice(blackHandLength).toUpperCase() +
+      sections[2].slice(0, blackHandLength).toLowerCase();
+  }
+  return sections.join(' ');
+}
+
+const USI_FLIP_MAP = {
+  '1': '9', '2': '8', '3': '7', '4': '6', '5': '5', '6': '4', '7': '3', '8': '2', '9': '1',
+  a: 'i', b: 'h', c: 'g', d: 'f', e: 'e', f: 'd', g: 'c', h: 'b', i: 'a',
+};
+
+function flippedUSIMove(usi) {
+  let flipped = '';
+  for (let i = 0; i < usi.length; i++) {
+    flipped += USI_FLIP_MAP[usi[i]] || usi[i];
+  }
+  return flipped;
+}
+
+// ---- フォーマット統合 + FlippedBook ----
+
+const { YbbBook } = require('./book-ybb');
+
+/**
+ * .db / .ybb 共通のファサード。
+ * - クエリの SFEN 正規化(手数→1)を一元化
+ * - 通常ヒットが無ければ 180°反転局面でも検索し、指し手を反転して返す
+ *   (やねうら王 FlippedBook 相当・常時有効)
+ */
+class Book {
+  constructor(impl, format) {
+    this.impl = impl;
+    this.format = format; // 'db' | 'ybb'
+  }
+  get mode() { return this.impl.mode; }
+  get entryCount() { return this.impl.entryCount; }
+  get path() { return this.impl.path; }
+
+  async searchMoves(sfen) {
+    const key = normalizeQuerySfen(sfen);
+    const direct = await this.impl.searchMoves(key);
+    if (direct.length > 0) return direct;
+
+    const flipped = await this.impl.searchMoves(flippedSFEN(key));
+    if (flipped.length === 0) return [];
+    return flipped.map((m) => {
+      const out = { ...m, usi: flippedUSIMove(m.usi) };
+      if (m.usi2) out.usi2 = flippedUSIMove(m.usi2);
+      return out;
+    });
+  }
+
+  close() { return this.impl.close(); }
+}
+
+/**
+ * 拡張子でフォーマットを判別して開く(.ybb はバイナリ、他は yane2016 テキスト)。
+ */
+async function openBook(path, opts = {}) {
+  const isYbb = String(path).toLowerCase().endsWith('.ybb');
+  const impl = isYbb ? await YbbBook.open(path, opts) : await YaneBook.open(path, opts);
+  return new Book(impl, isYbb ? 'ybb' : 'db');
+}
+
+module.exports = {
+  YaneBook,
+  openBook,
+  Book,
+  normalizeQuerySfen,
+  parseMoveLine,
+  flippedSFEN,
+  flippedUSIMove,
+  DEFAULT_ON_THE_FLY_THRESHOLD_MB,
+};

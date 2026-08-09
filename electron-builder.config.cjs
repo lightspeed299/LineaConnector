@@ -9,6 +9,8 @@ module.exports = {
     'main.js',
     'usi-engine.js',
     'book.js',
+    'book-ybb.js',
+    'packed-sfen.js',
     'preload.js',
     'renderer/**/*',
     'assets/**/*',

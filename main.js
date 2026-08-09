@@ -6,7 +6,7 @@ const os = require('os');
 const io = require('socket.io-client');
 const { autoUpdater } = require('electron-updater');
 const { UsiEngine } = require('./usi-engine');
-const { YaneBook } = require('./book');
+const { openBook } = require('./book');
 
 const CURRENT_VERSION = `v${require('./package.json').version}`;
 const DEFAULT_SERVER_URL = 'https://api.lineashogi.com';
@@ -219,10 +219,10 @@ async function ensureBook(config = currentConfig) {
       return null;
     }
     try {
-      const opened = await YaneBook.open(bookPath);
+      const opened = await openBook(bookPath);
       book = opened;
       bookLoadedPath = bookPath;
-      log(`定跡を読み込みました: ${path.basename(bookPath)} (${opened.mode === 'in-memory' ? `${opened.entryCount}局面` : '大容量モード'})`);
+      log(`定跡を読み込みました: ${path.basename(bookPath)} (${opened.format === 'ybb' ? 'ybb・' : ''}${opened.mode === 'in-memory' ? `${opened.entryCount}局面` : '大容量モード'})`);
       return opened;
     } catch (e) {
       log(`定跡の読み込みに失敗: ${e.message}`);
@@ -985,9 +985,9 @@ function setupIPC() {
   // 定跡ファイル選択
   ipcMain.handle('select-book-file', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
-      title: '定跡ファイルを選択（やねうら王 .db 形式）',
+      title: '定跡ファイルを選択（.db / .ybb）',
       filters: [
-        { name: '定跡DB (やねうら王形式)', extensions: ['db'] },
+        { name: '定跡DB (.db / .ybb)', extensions: ['db', 'ybb'] },
         { name: 'すべてのファイル', extensions: ['*'] }
       ],
       properties: ['openFile']
