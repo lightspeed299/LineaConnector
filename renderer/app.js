@@ -118,6 +118,10 @@
     $('#cfg-engine').value = cfg.enginePath || '';
     $('#cfg-eval').value = cfg.evalPath || '';
     $('#cfg-book').value = cfg.bookPath || '';
+    // 評価関数が未設定なら、エンジンから自動検出して初期値として埋める(保存で確定)
+    if (!cfg.evalPath && cfg.enginePath) {
+      void autofillEvalFromEngine(cfg.enginePath, { quiet: true });
+    }
     const opts = cfg.engineOptions || {};
     $('#cfg-threads').value = opts.Threads || 4;
     $('#cfg-hash').value = opts.USI_Hash || 1024;
@@ -128,6 +132,24 @@
     if (cfg.enginePath) {
       const name = cfg.enginePath.split('/').pop();
       $('#engine-name').textContent = name;
+    }
+  }
+
+  // ★エンジンに同梱された評価関数を検出して「評価関数」欄へ自動入力する
+  async function autofillEvalFromEngine(enginePath, { quiet } = {}) {
+    try {
+      const result = await window.connector.checkEvalFiles(enginePath);
+      if (!result.ok || result.files.length === 0) {
+        if (!quiet) addLog('⚠ 評価関数を自動検出できませんでした。「評価関数」の参照から指定できます');
+        return false;
+      }
+      const engineDir = enginePath.split('/').slice(0, -1).join('/');
+      const full = `${engineDir}/${result.files[0]}`;
+      $('#cfg-eval').value = full;
+      if (!quiet) addLog(`評価関数を自動検出 (${result.type}): ${result.files[0]}（変更する場合は参照から）`);
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -148,11 +170,10 @@
       if (filePath) {
         $('#cfg-engine').value = filePath;
         $('#engine-name').textContent = filePath.split('/').pop();
-        const result = await window.connector.checkEvalFiles(filePath);
-        if (result.ok) {
-          addLog(`評価関数を検出 (${result.type}): ${result.files.join(', ')}`);
-        } else {
-          addLog('⚠ 評価関数が見つかりません。エンジンと同じフォルダに配置するか、下の「評価関数」で指定してください。');
+        // エンジンに合わせて評価関数欄も自動更新(変更したい場合は参照から)
+        const filled = await autofillEvalFromEngine(filePath);
+        if (!filled) {
+          $('#cfg-eval').value = '';
         }
       }
     });
