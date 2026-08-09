@@ -128,6 +128,28 @@
       const name = cfg.enginePath.split('/').pop();
       $('#engine-name').textContent = name;
     }
+    updateEvalDisplay(cfg.enginePath);
+  }
+
+  // ★評価関数の検出表示（どの評価関数を使えているかを常時確認できるように）
+  async function updateEvalDisplay(enginePath) {
+    const el = $('#eval-name');
+    if (!el) return;
+    if (!enginePath) { el.textContent = '—'; return; }
+    try {
+      const result = await window.connector.checkEvalFiles(enginePath);
+      if (result.ok && result.files.length > 0) {
+        const head = result.files[0];
+        const more = result.files.length > 1 ? ` +${result.files.length - 1}` : '';
+        el.textContent = `${head}${more} (${result.type})`;
+        el.title = result.files.join('\n');
+      } else {
+        el.textContent = '未検出';
+        el.title = 'エンジンと同じフォルダ(または eval/ フォルダ)に評価関数が見つかりません';
+      }
+    } catch {
+      el.textContent = '—';
+    }
   }
 
   function setupMainHandlers(cfg) {
@@ -153,21 +175,16 @@
         } else {
           addLog('⚠ 評価関数が見つかりません。エンジンと同じフォルダに配置してください。');
         }
+        updateEvalDisplay(filePath);
       }
     });
 
-    // Book select / clear
+    // Book select
     $('#btn-select-book').addEventListener('click', async () => {
       const filePath = await window.connector.selectBookFile();
       if (filePath) {
         $('#cfg-book').value = filePath;
         addLog('定跡ファイルを選択しました。「設定を保存」で反映されます');
-      }
-    });
-    $('#btn-clear-book').addEventListener('click', () => {
-      if ($('#cfg-book').value) {
-        $('#cfg-book').value = '';
-        addLog('定跡設定を解除しました。「設定を保存」で反映されます');
       }
     });
 
