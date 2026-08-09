@@ -104,6 +104,9 @@ class UsiEngine {
     this.args = opts.args || [];
     this.cwd = opts.cwd || path.dirname(opts.cmd);
     this.engineOptions = { ...(opts.engineOptions || {}) };
+    // 評価関数ファイルのパス。エンジンが宣言するオプション名に合わせて
+    // EvalDir(親ディレクトリ) / EvalFile / DNN_Model のいずれかで適用する
+    this.evalPath = String(opts.evalPath || '');
     this.log = opts.log || (() => {});
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...(opts.timeouts || {}) };
 
@@ -312,6 +315,7 @@ class UsiEngine {
     }
 
     const report = this._sendOptions(Object.entries(this.engineOptions));
+    report.eval = this._applyEvalPath();
     this.launchReport = report;
 
     this._write('isready');
@@ -356,6 +360,40 @@ class UsiEngine {
       report.applied.push({ name: decl.name, value });
     }
     return report;
+  }
+
+  // 評価関数パスをエンジン宣言に合わせて適用する。
+  // 返り値: null(未設定) | {applied:{name,value}} | {skippedReason:'unsupported'}
+  _applyEvalPath() {
+    if (!this.evalPath) return null;
+    const p = this.evalPath.replace(/\\/g, '/');
+    const looksLikeFile = /\.[A-Za-z0-9]+$/.test(p.split('/').pop() || '');
+    const dir = looksLikeFile ? p.slice(0, Math.max(p.lastIndexOf('/'), 0)) || '.' : p;
+    let name = null;
+    let value = null;
+    if (this._resolveDeclaredExact('EvalDir')) {
+      name = 'EvalDir';
+      value = dir;
+    } else if (this._resolveDeclaredExact('EvalFile')) {
+      name = 'EvalFile';
+      value = p;
+    } else if (this._resolveDeclaredExact('DNN_Model')) {
+      name = 'DNN_Model';
+      value = p;
+    } else {
+      return { skippedReason: 'unsupported' };
+    }
+    this._write(`setoption name ${name} value ${sanitizeUSI(value)}`);
+    return { applied: { name, value } };
+  }
+
+  _resolveDeclaredExact(name) {
+    if (this.declaredOptions[name]) return this.declaredOptions[name];
+    const lower = name.toLowerCase();
+    for (const key of Object.keys(this.declaredOptions)) {
+      if (key.toLowerCase() === lower) return this.declaredOptions[key];
+    }
+    return null;
   }
 
   // 設定キー → 宣言済みオプションの解決。

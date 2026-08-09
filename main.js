@@ -81,6 +81,7 @@ function normalizeConfig(config) {
     engineOptions: normalizeEngineOptions(config?.engineOptions),
     bookPath: String(config?.bookPath || ''),
     useBook: config?.useBook === true || config?.useBook === 'true',
+    evalPath: String(config?.evalPath || ''),
   };
 }
 
@@ -272,14 +273,15 @@ const pendingInfoByMultipv = new Map(); // multipv -> payload
 let infoFlushTimer = null;
 
 // 定跡候補手を MultiPV 形式の解析行として送出する(ShogiHome usi.ts:204-220 と同じマッピング:
-// multipv=順位・scoreCP←評価値・nodes←採用数・pv←[手,応手])。既存の候補手UIがそのまま使われる。
+// multipv=順位・scoreCP←評価値・nodes←採用数)。既存の候補手UIがそのまま使われる。
+// pv は定跡の連鎖で最大10手まで延長済み(v6.3.0〜)。
 function emitBookMoves(sfen, turn, bookMoves) {
   if (!socket?.connected) return;
   const limit = Math.min(bookMoves.length, 10);
   log(`定跡ヒット: ${bookMoves.length}手 (${path.basename(currentConfig?.bookPath || '')})`);
   for (let i = 0; i < limit; i++) {
     const m = bookMoves[i];
-    const pv = m.usi2 ? [m.usi, m.usi2] : [m.usi];
+    const pv = Array.isArray(m.pv) && m.pv.length > 0 ? m.pv : (m.usi2 ? [m.usi, m.usi2] : [m.usi]);
     const v2 = {
       multipv: i + 1,
       pv,
@@ -368,6 +370,7 @@ function hasEngineConfigChanged(prevConfig, nextConfig) {
   if (!prevConfig) return true;
   return (
     normalizePathForCompare(prevConfig.enginePath) !== normalizePathForCompare(nextConfig.enginePath) ||
+    normalizePathForCompare(prevConfig.evalPath) !== normalizePathForCompare(nextConfig.evalPath) ||
     stableEngineOptions(prevConfig.engineOptions) !== stableEngineOptions(nextConfig.engineOptions)
   );
 }
@@ -549,7 +552,10 @@ function connectToServer(config) {
               isAnalyzing = false;
               if (engine) engine.stop();
             }
-            emitBookMoves(requestSfen, requestTurn, bookMoves);
+            // 定跡の連鎖でPVを延長(上位10候補のみ・最大10手)
+            const extended = await b.extendPvMoves(sfen, bookMoves.slice(0, 10));
+            if (lastSfen !== requestSfen || lastTurn !== requestTurn) return;
+            emitBookMoves(requestSfen, requestTurn, extended);
             scheduleEngineIdleShutdown();
             return;
           }
@@ -765,6 +771,7 @@ async function startEngine(config) {
     const e = new UsiEngine({
       cmd: enginePath,
       engineOptions: normalizedConfig.engineOptions || {},
+      evalPath: normalizedConfig.evalPath || '',
       log,
     });
     engine = e;
@@ -815,6 +822,13 @@ async function startEngine(config) {
       const res = await e.launch();
       if (engine !== e) return false; // 起動待ちの間に破棄された
       log(`エンジン準備完了: ${res.id.name || path.basename(enginePath)}`);
+      if (res.report.eval) {
+        if (res.report.eval.applied) {
+          log(`評価関数を適用: ${res.report.eval.applied.name} = ${res.report.eval.applied.value}`);
+        } else if (res.report.eval.skippedReason === 'unsupported') {
+          log('⚠ このエンジンは評価関数パスの指定に対応していません(EvalDir/EvalFile/DNN_Model未宣言)。エンジン既定の評価関数を使用します');
+        }
+      }
       if (res.report.skipped.length > 0) {
         log(`未対応オプションをスキップ: ${res.report.skipped.map((s) => s.name).join(', ')}`);
       }
@@ -980,6 +994,20 @@ function setupIPC() {
     } catch (e) {
       return { ok: false, error: e.message, files: [] };
     }
+  });
+
+  // 評価関数ファイル選択
+  ipcMain.handle('select-eval-file', async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: '評価関数ファイルを選択',
+      filters: [
+        { name: '評価関数 (bin / nnue / onnx)', extensions: ['bin', 'nnue', 'onnx'] },
+        { name: 'すべてのファイル', extensions: ['*'] }
+      ],
+      properties: ['openFile']
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0].replace(/\\/g, '/');
   });
 
   // 定跡ファイル選択

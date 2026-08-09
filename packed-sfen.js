@@ -381,4 +381,9 @@ module.exports = {
   packedSfenFromBuffer,
   packedSfenToBytes,
   comparePackedSfenBytes,
+  // SFEN文字列の構造化パーサ/シリアライザ(定跡PV延長の局面適用などに再利用)
+  parseBoard,
+  parseHands,
+  boardToSFEN,
+  handsToSFEN,
 };

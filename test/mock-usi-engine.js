@@ -76,7 +76,7 @@ rl.on('line', (raw) => {
     out('option name Threads type spin default 4 min 1 max 32');
     out('option name MultiPV type spin default 1 min 1 max 10');
     out('option name FV_SCALE type spin default 16 min 1 max 128');
-    out('option name EvalDir type string default <empty>');
+    if (!has('no-evaldir')) out('option name EvalDir type string default <empty>');
     out('option name ClearHash type button');
     out('option name Style type combo default Normal var Normal var Aggressive');
     if (!has('slow-usiok')) out('usiok');

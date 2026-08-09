@@ -15,6 +15,9 @@ contextBridge.exposeInMainWorld('connector', {
   // 定跡ファイル選択
   selectBookFile: () => ipcRenderer.invoke('select-book-file'),
 
+  // 評価関数ファイル選択
+  selectEvalFile: () => ipcRenderer.invoke('select-eval-file'),
+
   // 接続制御
   connect: (config) => ipcRenderer.invoke('connect', config),
   disconnect: () => ipcRenderer.invoke('disconnect'),

@@ -377,6 +377,60 @@ function flippedUSIMove(usi) {
   return flipped;
 }
 
+// ---- 定跡PV延長用の局面適用 ----
+// 定跡の指し手を信頼して盤面へ機械的に適用する(合法性の完全検証はしない)。
+// 解釈できない指し手には null を返し、呼び出し側は延長を打ち切る。
+
+const { parseBoard, parseHands, boardToSFEN, handsToSFEN } = require('./packed-sfen');
+
+function usiSquareToTsIndex(fileChar, rankChar) {
+  const file = fileChar.charCodeAt(0) - '0'.charCodeAt(0);
+  const rank = rankChar.charCodeAt(0) - 'a'.charCodeAt(0) + 1;
+  if (file < 1 || file > 9 || rank < 1 || rank > 9) return -1;
+  return (rank - 1) * 9 + (9 - file);
+}
+
+/**
+ * USI指し手をSFEN(正規化済み・手数1)へ適用して次局面のSFENを返す。適用不能ならnull。
+ */
+function applyUsiMoveToSfen(sfen, usi) {
+  try {
+    const [boardPart, turn, handsPart] = sfen.split(/\s+/);
+    if (turn !== 'b' && turn !== 'w') return null;
+    const { board } = parseBoard(boardPart);
+    const hands = parseHands(handsPart);
+    const mover = turn;
+
+    if (usi[1] === '*') {
+      const type = usi[0];
+      if (!hands[mover] || !(type in hands[mover]) || hands[mover][type] <= 0) return null;
+      const to = usiSquareToTsIndex(usi[2], usi[3]);
+      if (to < 0 || board[to]) return null;
+      hands[mover][type]--;
+      board[to] = { type, color: mover, promoted: false };
+    } else {
+      const from = usiSquareToTsIndex(usi[0], usi[1]);
+      const to = usiSquareToTsIndex(usi[2], usi[3]);
+      if (from < 0 || to < 0) return null;
+      const promote = usi.length >= 5 && usi[4] === '+';
+      const piece = board[from];
+      if (!piece || piece.color !== mover) return null;
+      const target = board[to];
+      if (target) {
+        if (target.color === mover) return null;
+        // 取った駒は成りを解いて持ち駒へ(玉は持ち駒にならない)
+        if (target.type !== 'K') hands[mover][target.type]++;
+      }
+      board[from] = undefined;
+      board[to] = { type: piece.type, color: mover, promoted: piece.promoted || promote };
+    }
+
+    return `${boardToSFEN(board)} ${mover === 'b' ? 'w' : 'b'} ${handsToSFEN(hands)} 1`;
+  } catch (_) {
+    return null;
+  }
+}
+
 // ---- フォーマット統合 + FlippedBook ----
 
 const { YbbBook } = require('./book-ybb');
@@ -410,6 +464,41 @@ class Book {
     });
   }
 
+  /**
+   * 各候補手のPVを定跡の連鎖で延長する(ShogiHomeには無い機能。定跡は局面→候補手の
+   * 写像なので、手を適用した次局面を再度引いて先頭手を繋げば読み筋を合成できる)。
+   * usi2(相手の応手)があれば優先し、以降は各局面の定跡先頭手を辿る。
+   * 千日手ループはvisitedで打ち切り。返り値は moves に pv:[...] を付けたコピー。
+   */
+  async extendPvMoves(sfen, moves, maxPlies = 10) {
+    const baseKey = normalizeQuerySfen(sfen);
+    const out = [];
+    for (const m of moves) {
+      const pv = [m.usi];
+      let cur = applyUsiMoveToSfen(baseKey, m.usi);
+      if (cur && m.usi2) {
+        const next = applyUsiMoveToSfen(cur, m.usi2);
+        if (next) {
+          pv.push(m.usi2);
+          cur = next;
+        }
+      }
+      const visited = new Set([baseKey]);
+      while (cur && pv.length < maxPlies && !visited.has(cur)) {
+        visited.add(cur);
+        const candidates = await this.searchMoves(cur);
+        if (candidates.length === 0) break;
+        const best = candidates[0];
+        const applied = applyUsiMoveToSfen(cur, best.usi);
+        if (!applied) break;
+        pv.push(best.usi);
+        cur = applied;
+      }
+      out.push({ ...m, pv });
+    }
+    return out;
+  }
+
   close() { return this.impl.close(); }
 }
 
@@ -430,5 +519,6 @@ module.exports = {
   parseMoveLine,
   flippedSFEN,
   flippedUSIMove,
+  applyUsiMoveToSfen,
   DEFAULT_ON_THE_FLY_THRESHOLD_MB,
 };

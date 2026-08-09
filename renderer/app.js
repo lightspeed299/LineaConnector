@@ -116,6 +116,7 @@
   function populateSettings(cfg) {
     $('#cfg-apikey').value = cfg.apiKey || '';
     $('#cfg-engine').value = cfg.enginePath || '';
+    $('#cfg-eval').value = cfg.evalPath || '';
     $('#cfg-book').value = cfg.bookPath || '';
     const opts = cfg.engineOptions || {};
     $('#cfg-threads').value = opts.Threads || 4;
@@ -127,28 +128,6 @@
     if (cfg.enginePath) {
       const name = cfg.enginePath.split('/').pop();
       $('#engine-name').textContent = name;
-    }
-    updateEvalDisplay(cfg.enginePath);
-  }
-
-  // ★評価関数の検出表示（どの評価関数を使えているかを常時確認できるように）
-  async function updateEvalDisplay(enginePath) {
-    const el = $('#eval-name');
-    if (!el) return;
-    if (!enginePath) { el.textContent = '—'; return; }
-    try {
-      const result = await window.connector.checkEvalFiles(enginePath);
-      if (result.ok && result.files.length > 0) {
-        const head = result.files[0];
-        const more = result.files.length > 1 ? ` +${result.files.length - 1}` : '';
-        el.textContent = `${head}${more} (${result.type})`;
-        el.title = result.files.join('\n');
-      } else {
-        el.textContent = '未検出';
-        el.title = 'エンジンと同じフォルダ(または eval/ フォルダ)に評価関数が見つかりません';
-      }
-    } catch {
-      el.textContent = '—';
     }
   }
 
@@ -173,9 +152,17 @@
         if (result.ok) {
           addLog(`評価関数を検出 (${result.type}): ${result.files.join(', ')}`);
         } else {
-          addLog('⚠ 評価関数が見つかりません。エンジンと同じフォルダに配置してください。');
+          addLog('⚠ 評価関数が見つかりません。エンジンと同じフォルダに配置するか、下の「評価関数」で指定してください。');
         }
-        updateEvalDisplay(filePath);
+      }
+    });
+
+    // Eval select
+    $('#btn-select-eval').addEventListener('click', async () => {
+      const filePath = await window.connector.selectEvalFile();
+      if (filePath) {
+        $('#cfg-eval').value = filePath;
+        addLog('評価関数を選択しました。「設定を保存」でエンジンに反映されます');
       }
     });
 
@@ -198,6 +185,7 @@
         serverUrl: activeConfig.serverUrl || DEFAULT_SERVER_URL,
         apiKey: $('#cfg-apikey').value,
         enginePath: $('#cfg-engine').value,
+        evalPath: $('#cfg-eval').value,
         bookPath: $('#cfg-book').value,
         useBook: activeConfig.useBook === true,
         engineMode: $('#cfg-engine-ondemand').checked ? ENGINE_MODE_ON_DEMAND : ENGINE_MODE_ALWAYS,

@@ -253,6 +253,79 @@ test('FlippedBook: .ybbでも反転ヒットする', async () => {
   }
 });
 
+// ---- 局面適用 + 定跡PV延長 ----
+
+const { applyUsiMoveToSfen } = require('../book.js');
+
+test('applyUsiMoveToSfen: 移動・成り・駒取り(成駒は解除して持ち駒へ)・打ちが正しい', () => {
+  // 7六歩
+  assert.equal(
+    applyUsiMoveToSfen(STARTPOS, '7g7f'),
+    'lnsgkgsnl/1r5b1/ppppppppp/9/9/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL w - 1');
+  // 移動元が空/相手駒 → null
+  assert.equal(applyUsiMoveToSfen(STARTPOS, '5e5d'), null);
+  assert.equal(applyUsiMoveToSfen(STARTPOS, '3c3d'), null);
+  // 成り+駒取り: 角交換(8h2b+)で後手角を取り成る。取った駒は持ち駒Bへ
+  const openDiag = applyUsiMoveToSfen(applyUsiMoveToSfen(STARTPOS, '7g7f'), '3c3d');
+  assert.equal(
+    applyUsiMoveToSfen(openDiag, '8h2b+'),
+    'lnsgkgsnl/1r5+B1/pppppp1pp/6p2/9/2P6/PP1PPPPPP/7R1/LNSGKGSNL w B 1');
+  // 打ち: 持ち駒が無ければnull・あれば置ける
+  assert.equal(applyUsiMoveToSfen(STARTPOS, 'P*5e'), null);
+  const withHand = '4k4/9/9/9/9/9/9/9/4K4 b P 1';
+  assert.equal(applyUsiMoveToSfen(withHand, 'P*5e'), '4k4/9/9/9/4P4/9/9/9/4K4 w - 1');
+});
+
+test('定跡PV延長: usi2優先→以降は各局面の定跡先頭手を連鎖する(flip経由も)', async () => {
+  const pos1 = STARTPOS;                                   // 7g7f (usi2: 3c3d)
+  const pos2 = applyUsiMoveToSfen(applyUsiMoveToSfen(pos1, '7g7f'), '3c3d'); // 2g2f
+  const pos3 = applyUsiMoveToSfen(pos2, '2g2f');           // flip側にだけ登録: 8c8d相当
+  const pos3Flipped = flippedSFEN(pos3);
+  const db = [
+    '#YANEURAOU-DB2016 1.00',
+    ...[
+      [pos1, '7g7f 3c3d 50 20 100'],
+      [pos2, '2g2f none 40 18 80'],
+      [pos3Flipped, `${flippedUSIMove('8c8d')} none 30 15 60`],
+    ].sort((a, b) => (a[0] < b[0] ? -1 : 1)).flatMap(([sfen, mv]) => [`sfen ${sfen}`, mv]),
+    '',
+  ].join('\n');
+  const p = tmpFile('chain.db', db);
+  const book = await openBook(p);
+  try {
+    const moves = await book.searchMoves(pos1);
+    const extended = await book.extendPvMoves(pos1, moves);
+    assert.deepEqual(extended[0].pv, ['7g7f', '3c3d', '2g2f', '8c8d']);
+  } finally {
+    await book.close();
+  }
+});
+
+test('定跡PV延長: 循環はvisitedで打ち切られ無限ループしない', async () => {
+  // 王が行き来するだけの循環定跡(4局面で一周)
+  const a = '4k4/9/9/9/9/9/9/9/4K4 b - 1';
+  const b = applyUsiMoveToSfen(a, '5i5h');
+  const c = applyUsiMoveToSfen(b, '5a5b');
+  const d = applyUsiMoveToSfen(c, '5h5i');
+  // d から 5b5a で a に戻る
+  const entries = [
+    [a, '5i5h none 0 1 1'],
+    [b, '5a5b none 0 1 1'],
+    [c, '5h5i none 0 1 1'],
+    [d, '5b5a none 0 1 1'],
+  ].sort((x, y) => (x[0] < y[0] ? -1 : 1));
+  const db = ['#YANEURAOU-DB2016 1.00', ...entries.flatMap(([s, m]) => [`sfen ${s}`, m]), ''].join('\n');
+  const book = await openBook(tmpFile('cycle.db', db));
+  try {
+    const moves = await book.searchMoves(a);
+    const extended = await book.extendPvMoves(a, moves, 10);
+    assert.ok(extended[0].pv.length <= 5, `循環が打ち切られる: ${extended[0].pv.join(' ')}`);
+    assert.deepEqual(extended[0].pv.slice(0, 4), ['5i5h', '5a5b', '5h5i', '5b5a']);
+  } finally {
+    await book.close();
+  }
+});
+
 test('後始末', () => {
   if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
 });

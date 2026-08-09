@@ -296,6 +296,39 @@ test('未flushの予約searchがanalyzeの上書きでもpreempted解決され�
   });
 });
 
+test('evalPath: 宣言済みEvalDirへ親ディレクトリが適用される', async () => {
+  const engine = makeEngine({});
+  engine.evalPath = 'C:/Shogi/Engines/foo/eval/nn.bin';
+  try {
+    const res = await engine.launch();
+    assert.deepEqual(res.report.eval, { applied: { name: 'EvalDir', value: 'C:/Shogi/Engines/foo/eval' } });
+    assert.ok(sent(engine).includes('setoption name EvalDir value C:/Shogi/Engines/foo/eval'));
+  } finally {
+    await engine.quit();
+  }
+});
+
+test('evalPath: ディレクトリ指定ならそのまま・EvalDir未宣言ならunsupported', async () => {
+  const dirEngine = makeEngine({});
+  dirEngine.evalPath = 'C:/Shogi/EvalDir';
+  try {
+    const res = await dirEngine.launch();
+    assert.equal(res.report.eval.applied.value, 'C:/Shogi/EvalDir');
+  } finally {
+    await dirEngine.quit();
+  }
+
+  const noEval = makeEngine({ behaviors: ['no-evaldir'] });
+  noEval.evalPath = 'C:/Shogi/eval/nn.bin';
+  try {
+    const res = await noEval.launch();
+    assert.deepEqual(res.report.eval, { skippedReason: 'unsupported' });
+    assert.ok(!sent(noEval).some((l) => l.startsWith('setoption name EvalDir')));
+  } finally {
+    await noEval.quit();
+  }
+});
+
 test('未知のゴミ行が混ざっても解析は継続する', async () => {
   await withEngine({ behaviors: ['noisy'] }, async (engine) => {
     const infos = [];
