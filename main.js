@@ -212,18 +212,21 @@ function closeBook() {
 function bookStatusForSync() {
   const bookPath = String(currentConfig?.bookPath || '');
   if (!bookPath) return { bookFile: null, bookStatus: null };
+  // 表示名は登録簿の一意ラベル(user_book1.db 衝突時は親フォルダ付き)を優先
+  const activeBook = currentConfig?.books?.[currentConfig.defaultBookUri];
+  const bookFile = activeBook?.name || path.basename(bookPath);
   if (book && bookLoadedPath === bookPath) {
     return {
-      bookFile: path.basename(bookPath),
+      bookFile,
       bookStatus: 'ok',
       bookMode: book.mode,
       bookEntries: book.mode === 'in-memory' ? book.entryCount : undefined,
     };
   }
   if (bookLoadedPath === `error:${bookPath}`) {
-    return { bookFile: path.basename(bookPath), bookStatus: 'error' };
+    return { bookFile, bookStatus: 'error' };
   }
-  return { bookFile: path.basename(bookPath), bookStatus: 'loading' };
+  return { bookFile, bookStatus: 'loading' };
 }
 
 // ★エンジン自動再起動（クラッシュ時）: 1分間に最大3回まで

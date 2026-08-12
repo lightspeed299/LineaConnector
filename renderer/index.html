@@ -148,6 +148,8 @@
             <button id="btn-book-add" class="btn-secondary btn-sm" title="定跡ファイルを追加登録">追加</button>
             <button id="btn-book-del" class="btn-icon btn-sm" title="選択中の定跡を登録から削除">削除</button>
           </div>
+          <!-- 定跡はファイル名が user_book1.db 等で衝突しやすいため、選択中のフルパスを常時表示 -->
+          <input type="text" id="cfg-book-path" class="stacked-path" readonly placeholder="未設定" title="選択中の定跡のフルパス">
         </div>
         <label class="check-option compact">
           <input type="checkbox" id="cfg-engine-ondemand">

@@ -332,6 +332,14 @@ select:focus {
 }
 .input-row select { flex: 1; min-width: 0; }
 
+/* セレクトの下に重ねるフルパス表示（定跡など、ファイル名だけでは区別できないもの用） */
+.stacked-path {
+  width: 100%;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
 /* 選択中エンジンの編集ボックス（登録簿の1エントリ分） */
 .engine-entry-box {
   border: 1px solid var(--border-light);

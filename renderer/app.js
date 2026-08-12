@@ -140,6 +140,30 @@
     return String(p || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || '定跡';
   }
 
+  // パス末尾の depth+1 セグメントをラベル化（config-schema.js の uniquifyBookNames と同ロジック。
+  // user_book1.db 衝突時だけ親フォルダを足して区別する — 保存前のドラフト表示用）
+  function bookLabelFromPath(p, depth) {
+    const parts = String(p || '').replace(/\\/g, '/').split('/').filter(Boolean);
+    return parts.slice(Math.max(0, parts.length - 1 - depth)).join('/');
+  }
+
+  function uniquifyDraftBookNames() {
+    const entries = Object.values(draftBooks);
+    for (const e of entries) e.name = bookLabelFromPath(e.path, 0) || '定跡';
+    for (let depth = 1; depth <= 4; depth++) {
+      const counts = new Map();
+      for (const e of entries) counts.set(e.name, (counts.get(e.name) || 0) + 1);
+      let changed = false;
+      for (const e of entries) {
+        if ((counts.get(e.name) || 0) > 1) {
+          const next = bookLabelFromPath(e.path, depth);
+          if (next && next !== e.name) { e.name = next; changed = true; }
+        }
+      }
+      if (!changed) break;
+    }
+  }
+
   function populateSettings(cfg) {
     $('#cfg-apikey').value = cfg.apiKey || '';
     $('#cfg-engine-ondemand').checked = cfg.engineMode === ENGINE_MODE_ON_DEMAND;
@@ -161,6 +185,7 @@
   function renderBookSelect() {
     const sel = $('#cfg-book-select');
     sel.innerHTML = '';
+    uniquifyDraftBookNames();
     const uris = Object.keys(draftBooks);
     if (uris.length === 0) {
       const opt = document.createElement('option');
@@ -180,7 +205,9 @@
       }
       sel.value = selectedBookUri;
     }
-    sel.title = draftBooks[selectedBookUri]?.path || '使用する定跡を選択';
+    const selectedPath = draftBooks[selectedBookUri]?.path || '';
+    sel.title = selectedPath || '使用する定跡を選択';
+    $('#cfg-book-path').value = selectedPath;
     $('#btn-book-del').disabled = uris.length === 0;
   }
 
@@ -404,7 +431,10 @@
       };
       const result = await window.connector.saveConfig(updated);
       if (result?.ok) {
-        activeConfig = updated;
+        // 正規化済み(表示名の一意化・登録簿の採番済み)の設定を読み直してドラフトを同期
+        const fresh = await window.connector.getConfig();
+        activeConfig = fresh || updated;
+        if (fresh) populateSettings(fresh);
         addLog(result.restartedSocket
           ? '設定を保存し、接続を更新しました'
           : result.restartedEngine

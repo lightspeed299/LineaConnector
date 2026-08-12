@@ -1,3 +1,10 @@
+## v6.5.1 Book Path Display
+
+- **Fix: 定跡の表示名が区別できない問題**（やねうら王系の定跡はほぼ `user_book1.db` で同名のため）
+  - Connector の定跡欄に**選択中ファイルのフルパスを常時表示**
+  - 選択肢の表示名は、同名ファイルが登録されたときだけ親フォルダ付きで自動的に区別（例: `petashock/user_book1.db` と `suisho/user_book1.db`）。この表示名は Web 研究室の定跡セレクタにもそのまま使われる（フルパス自体は従来どおり Web へ送らない）
+- 設定保存後は正規化済みの登録簿を読み直して表示を同期
+
 ## v6.5.0 Engine & Book Selection from Web
 
 - **Add: Web研究室からのエンジン切替**

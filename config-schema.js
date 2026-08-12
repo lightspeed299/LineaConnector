@@ -118,7 +118,7 @@ function engineFieldsDiffer(entry, flat) {
   );
 }
 
-// 定跡エントリ。プロセス寿命がないためエンジンより薄い（名前はファイル名固定）
+// 定跡エントリ。プロセス寿命がないためエンジンより薄い（名前はパスから導出）
 function sanitizeBookEntry(uri, entry) {
   const src = entry && typeof entry === 'object' ? entry : {};
   const bookPath = String(src.path || '');
@@ -129,6 +129,38 @@ function sanitizeBookEntry(uri, entry) {
     path: bookPath,
     ...(typeof src.createdAt === 'number' ? { createdAt: src.createdAt } : {}),
   };
+}
+
+// パス末尾の depth+1 セグメントをラベル化（depth=0 でファイル名のみ）
+function bookLabelFromPath(bookPath, depth) {
+  const parts = normalizePathForCompare(bookPath).split('/').filter(Boolean);
+  return parts.slice(Math.max(0, parts.length - 1 - depth)).join('/');
+}
+
+// 定跡はやねうら王系の慣習でファイル名が衝突しやすい(user_book1.db だらけ)ため、
+// 衝突するエントリだけ親フォルダを1段ずつ足して区別できる表示名にする。
+// この name がそのまま Web のカタログにも流れる（フルパスは送らない方針の中で、
+// 区別に必要な最小限のフォルダ名だけが露出する）
+function uniquifyBookNames(books) {
+  const entries = Object.values(books);
+  for (const e of entries) {
+    e.name = bookLabelFromPath(e.path, 0) || '定跡';
+  }
+  for (let depth = 1; depth <= 4; depth++) {
+    const counts = new Map();
+    for (const e of entries) counts.set(e.name, (counts.get(e.name) || 0) + 1);
+    let changed = false;
+    for (const e of entries) {
+      if ((counts.get(e.name) || 0) > 1) {
+        const next = bookLabelFromPath(e.path, depth);
+        if (next && next !== e.name) {
+          e.name = next;
+          changed = true;
+        }
+      }
+    }
+    if (!changed) break; // 同一パスの二重登録などは同名のまま打ち切り
+  }
 }
 
 function normalizeConfig(config) {
@@ -210,6 +242,9 @@ function normalizeConfig(config) {
   ) {
     books[defaultBookUri] = sanitizeBookEntry(defaultBookUri, { ...activeBook, path: base.bookPath });
   }
+
+  // 表示名の一意化（user_book1.db 衝突対策）
+  uniquifyBookNames(books);
 
   // ミラー: フラット項目は常に使用中エンジン/定跡の写し
   const mirrored = engines[defaultEngineUri];

@@ -187,6 +187,45 @@ test('定跡: 旧バージョンで bookPath だけ変更→使用中エント�
   assert.equal(drifted.books[drifted.defaultBookUri].name, 'new.db');
 });
 
+test('定跡: 同名ファイル(user_book1.db)は親フォルダ付きの一意な表示名になる', () => {
+  const uriA = generateBookUri();
+  const uriB = generateBookUri();
+  const uriC = generateBookUri();
+  const c = normalizeConfig({
+    ...FLAT,
+    books: {
+      [uriA]: { uri: uriA, path: 'C:/books/petashock/user_book1.db' },
+      [uriB]: { uri: uriB, path: 'C:/books/suisho/user_book1.db' },
+      [uriC]: { uri: uriC, path: 'C:/books/standard_book.db' },
+    },
+    defaultBookUri: uriA,
+    bookPath: 'C:/books/petashock/user_book1.db',
+  });
+  assert.equal(c.books[uriA].name, 'petashock/user_book1.db');
+  assert.equal(c.books[uriB].name, 'suisho/user_book1.db');
+  // 衝突しないものはファイル名のまま
+  assert.equal(c.books[uriC].name, 'standard_book.db');
+  // 同期(bookFile表示・カタログ)にも一意ラベルが流れる前提の冪等性
+  const c2 = normalizeConfig(c);
+  assert.deepEqual(c2, c);
+});
+
+test('定跡: 親フォルダまで同名なら更に上位のフォルダで区別する', () => {
+  const uriA = generateBookUri();
+  const uriB = generateBookUri();
+  const c = normalizeConfig({
+    ...FLAT,
+    books: {
+      [uriA]: { uri: uriA, path: 'C:/petashock/books/user_book1.db' },
+      [uriB]: { uri: uriB, path: 'C:/suisho/books/user_book1.db' },
+    },
+    defaultBookUri: uriA,
+    bookPath: 'C:/petashock/books/user_book1.db',
+  });
+  assert.equal(c.books[uriA].name, 'petashock/books/user_book1.db');
+  assert.equal(c.books[uriB].name, 'suisho/books/user_book1.db');
+});
+
 test('generateEngineUri/表示名ヘルパー', () => {
   assert.notEqual(generateEngineUri(), generateEngineUri());
   assert.equal(engineDisplayNameFromPath('C:\\engines\\YaneuraOu_NNUE.exe'), 'YaneuraOu_NNUE');
