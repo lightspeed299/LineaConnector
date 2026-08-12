@@ -7,6 +7,7 @@ module.exports = {
   productName: 'Linea Connector',
   files: [
     'main.js',
+    'config-schema.js',
     'usi-engine.js',
     'book.js',
     'book-ybb.js',
