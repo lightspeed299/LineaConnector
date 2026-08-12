@@ -100,10 +100,9 @@
       <section class="settings-panel">
         <h2>設定</h2>
         <div class="form-group">
-          <label for="cfg-apikey">APIキー</label>
+          <label for="cfg-apikey">APIキー（再発行したら新しいキーを貼り付けて保存）</label>
           <div class="input-row">
-            <input type="password" id="cfg-apikey" readonly>
-            <button id="btn-toggle-key" class="btn-icon" title="表示/非表示">表示</button>
+            <input type="password" id="cfg-apikey" autocomplete="off" spellcheck="false">
           </div>
         </div>
         <div class="form-group">

@@ -165,7 +165,12 @@
   }
 
   function populateSettings(cfg) {
-    $('#cfg-apikey').value = cfg.apiKey || '';
+    // APIキーは表示しない(書き込み専用)。貼り付けて保存すると置き換わる
+    const keyField = $('#cfg-apikey');
+    keyField.value = '';
+    keyField.placeholder = cfg.apiKeyDecryptFailed
+      ? 'キーを復号できませんでした — 再発行したキーを貼り付けてください'
+      : (cfg.apiKey ? '設定済み（変更するには新しいキーを貼り付け）' : 'sk_live_...');
     $('#cfg-engine-ondemand').checked = cfg.engineMode === ENGINE_MODE_ON_DEMAND;
 
     draftEngines = JSON.parse(JSON.stringify(cfg.engines || {}));
@@ -279,14 +284,6 @@
 
   function setupMainHandlers(cfg) {
     activeConfig = { ...cfg };
-
-    // API Key visibility toggle
-    let keyVisible = false;
-    $('#btn-toggle-key').addEventListener('click', () => {
-      keyVisible = !keyVisible;
-      $('#cfg-apikey').type = keyVisible ? 'text' : 'password';
-      $('#btn-toggle-key').textContent = keyVisible ? '非表示' : '表示';
-    });
 
     // ===== エンジン登録簿の操作 =====
     $('#cfg-engine-select').addEventListener('change', (ev) => {
@@ -412,11 +409,17 @@
       let hash = parseInt($('#cfg-hash').value, 10) || 1024;
       if (threads > maxThreads) { threads = maxThreads; $('#cfg-threads').value = threads; addLog(`Threadsを${maxThreads}に制限しました (CPUコア数上限)`); }
       if (hash > maxHashMB) { hash = maxHashMB; $('#cfg-hash').value = hash; addLog(`Hashを${maxHashMB}MBに制限しました (メモリ75%上限)`); }
+      // APIキー: 欄に貼り付けがあれば置き換え、空なら現在のキーを維持
+      const typedKey = $('#cfg-apikey').value.trim();
+      if (typedKey && !/^sk_live_[0-9a-f]{48}$/.test(typedKey)) {
+        addLog('⚠ APIキーの形式が正しくありません（sk_live_ で始まる発行済みキーを貼り付けてください）');
+        return;
+      }
       stashEngineFields();
       const selected = draftEngines[selectedUri];
       const updated = {
         serverUrl: activeConfig?.serverUrl || DEFAULT_SERVER_URL,
-        apiKey: $('#cfg-apikey').value,
+        apiKey: typedKey || activeConfig?.apiKey || '',
         // 登録簿(v2)。フラット項目は使用中エンジンのミラー(旧バージョン互換+main側の差分検出用)
         engines: draftEngines,
         defaultEngineUri: selectedUri,

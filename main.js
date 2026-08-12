@@ -1,5 +1,5 @@
 // Linea Connector — Electron Main Process
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -95,13 +95,56 @@ function migrateOldConfig() {
   }
 }
 
+// --- APIキーの保存時暗号化(v6.6.0〜) ---
+// サーバーは接続時に平文キーを受け取り sha256 で照合するため、手元には送信できる形の
+// 秘密が必要（ハッシュ保存は認証に使えず不可）。代わりに OS ユーザー資格情報に紐づく
+// safeStorage(Windows DPAPI)でディスク上だけ暗号化する。ファイル単体の持ち出し
+// （バックアップ・クラウド同期・サポートへの config.json 添付）でキーが漏れなくなる。
+// ShogiHome の CSA パスワード保存と同じ方式。メモリ上の config は平文 apiKey を保持する。
+
+function encryptConfigForStore(config) {
+  const { apiKey, apiKeyEnc, apiKeyDecryptFailed, ...rest } = config || {};
+  if (!apiKey) {
+    // キー未設定/復号失敗中: 既存の暗号文は温存する(元のOSユーザーへ戻せば復号できる)
+    return apiKeyEnc ? { ...rest, apiKeyEnc } : rest;
+  }
+  try {
+    if (safeStorage.isEncryptionAvailable()) {
+      return { ...rest, apiKeyEnc: safeStorage.encryptString(apiKey).toString('base64') };
+    }
+  } catch (e) { /* 暗号化不可なら平文へフォールバック */ }
+  return { ...rest, apiKey };
+}
+
+function decryptStoredConfig(parsed) {
+  if (!parsed || typeof parsed !== 'object') return parsed;
+  if (parsed.apiKey || !parsed.apiKeyEnc) return parsed;
+  try {
+    const apiKey = safeStorage.decryptString(Buffer.from(String(parsed.apiKeyEnc), 'base64'));
+    return { ...parsed, apiKey };
+  } catch (e) {
+    // OSユーザーの変更・プロファイル破損など。設定画面から再入力してもらう
+    log(`⚠ APIキーを復号できませんでした(${e.message})。設定画面で新しいキーを貼り付けてください`);
+    return { ...parsed, apiKey: '', apiKeyDecryptFailed: true };
+  }
+}
+
+// 書き戻し判定用: 暗号文は同じ平文でも毎回変わる(DPAPI)ため、キー系を除いて比較する
+function stripKeyFields(config) {
+  const { apiKey, apiKeyEnc, apiKeyDecryptFailed, ...rest } = config || {};
+  return rest;
+}
+
 function loadConfig() {
   try {
     if (fs.existsSync(CONFIG_PATH)) {
       const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
-      const normalized = normalizeConfig(parsed);
-      if (configsDiffer(parsed, normalized)) {
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(normalized, null, 2));
+      const normalized = normalizeConfig(decryptStoredConfig(parsed));
+      const storedForm = encryptConfigForStore(normalized);
+      // 旧形式の平文キーが残っていれば暗号化保存へ即移行する
+      const hasLegacyPlaintextKey = typeof parsed.apiKey === 'string' && parsed.apiKey && !!storedForm.apiKeyEnc;
+      if (hasLegacyPlaintextKey || configsDiffer(stripKeyFields(parsed), stripKeyFields(storedForm))) {
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(storedForm, null, 2));
         log('設定ファイルを最新形式へ移行しました');
       }
       return normalized;
@@ -113,7 +156,7 @@ function loadConfig() {
 }
 
 function saveConfig(config) {
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(normalizeConfig(config), null, 2));
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(encryptConfigForStore(normalizeConfig(config)), null, 2));
 }
 
 // --- ログ送信 ---
