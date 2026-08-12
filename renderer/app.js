@@ -21,12 +21,14 @@
     if (hEl) { hEl.max = maxH; hEl.title = `最大 ${maxH} MB (搭載メモリの75%)`; }
   }
 
-  // ===== エンジン登録簿（v6.4.0〜）の編集状態 =====
-  // 「設定を保存」までのローカル編集ドラフト。保存時に engines + defaultEngineUri と
-  // 使用中エンジンのミラー(フラット項目)を main へ渡す。
+  // ===== エンジン/定跡登録簿（v6.4.0〜/v6.5.0〜）の編集状態 =====
+  // 「設定を保存」までのローカル編集ドラフト。保存時に engines/books + default*Uri と
+  // 使用中エンジン・定跡のミラー(フラット項目)を main へ渡す。
   // ※起動直後の showMain() から使うため、宣言は起動分岐より前に置くこと(TDZ回避)
   let draftEngines = {};
   let selectedUri = '';
+  let draftBooks = {};
+  let selectedBookUri = '';
   let activeConfig = null;
   const DEFAULT_ENGINE_OPTIONS = { Threads: 4, USI_Hash: 1024, MultiPV: 3, FV_SCALE: 24 };
 
@@ -123,9 +125,9 @@
     }
   }
 
-  function generateEngineUri() {
-    // main側 config-schema.js と同形式(le://engine/...)。一意性だけが目的
-    return `le://engine/${Date.now()}/${Math.random().toString(16).slice(2, 10)}`;
+  function generateUri(kind) {
+    // main側 config-schema.js と同形式(le://engine|book/...)。一意性だけが目的
+    return `le://${kind}/${Date.now()}/${Math.random().toString(16).slice(2, 10)}`;
   }
 
   function engineDisplayNameFromPath(p) {
@@ -133,9 +135,13 @@
     return base.replace(/\.(exe|bat|cmd)$/i, '') || 'エンジン';
   }
 
+  // 定跡の表示名は拡張子込みのファイル名（.db/.ybb の区別が情報になる）
+  function bookDisplayNameFromPath(p) {
+    return String(p || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || '定跡';
+  }
+
   function populateSettings(cfg) {
     $('#cfg-apikey').value = cfg.apiKey || '';
-    $('#cfg-book').value = cfg.bookPath || '';
     $('#cfg-engine-ondemand').checked = cfg.engineMode === ENGINE_MODE_ON_DEMAND;
 
     draftEngines = JSON.parse(JSON.stringify(cfg.engines || {}));
@@ -144,6 +150,38 @@
       : (Object.keys(draftEngines)[0] || '');
     renderEngineSelect();
     loadEngineFields();
+
+    draftBooks = JSON.parse(JSON.stringify(cfg.books || {}));
+    selectedBookUri = cfg.defaultBookUri && draftBooks[cfg.defaultBookUri]
+      ? cfg.defaultBookUri
+      : (Object.keys(draftBooks)[0] || '');
+    renderBookSelect();
+  }
+
+  function renderBookSelect() {
+    const sel = $('#cfg-book-select');
+    sel.innerHTML = '';
+    const uris = Object.keys(draftBooks);
+    if (uris.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '未設定';
+      sel.appendChild(opt);
+      selectedBookUri = '';
+    } else {
+      for (const [uri, b] of Object.entries(draftBooks)) {
+        const opt = document.createElement('option');
+        opt.value = uri;
+        opt.textContent = b.name || bookDisplayNameFromPath(b.path);
+        sel.appendChild(opt);
+      }
+      if (!selectedBookUri || !draftBooks[selectedBookUri]) {
+        selectedBookUri = uris[0];
+      }
+      sel.value = selectedBookUri;
+    }
+    sel.title = draftBooks[selectedBookUri]?.path || '使用する定跡を選択';
+    $('#btn-book-del').disabled = uris.length === 0;
   }
 
   function renderEngineSelect() {
@@ -241,7 +279,7 @@
       const filePath = await window.connector.selectEngineFile();
       if (!filePath) return;
       stashEngineFields();
-      const uri = generateEngineUri();
+      const uri = generateUri('engine');
       draftEngines[uri] = {
         uri,
         name: engineDisplayNameFromPath(filePath),
@@ -260,7 +298,7 @@
       if (!draftEngines[selectedUri]) return;
       stashEngineFields();
       const src = draftEngines[selectedUri];
-      const uri = generateEngineUri();
+      const uri = generateUri('engine');
       draftEngines[uri] = JSON.parse(JSON.stringify({ ...src, uri, name: `${src.name}のコピー`, createdAt: Date.now() }));
       selectedUri = uri;
       renderEngineSelect();
@@ -313,13 +351,32 @@
       }
     });
 
-    // Book select
-    $('#btn-select-book').addEventListener('click', async () => {
+    // ===== 定跡登録簿の操作 =====
+    $('#cfg-book-select').addEventListener('change', (ev) => {
+      if (!ev.target.value) return;
+      selectedBookUri = ev.target.value;
+      renderBookSelect();
+      addLog('定跡を切り替えるには「設定を保存」を押してください');
+    });
+
+    $('#btn-book-add').addEventListener('click', async () => {
       const filePath = await window.connector.selectBookFile();
-      if (filePath) {
-        $('#cfg-book').value = filePath;
-        addLog('定跡ファイルを選択しました。「設定を保存」で反映されます');
-      }
+      if (!filePath) return;
+      const uri = generateUri('book');
+      draftBooks[uri] = { uri, name: bookDisplayNameFromPath(filePath), path: filePath, createdAt: Date.now() };
+      selectedBookUri = uri;
+      renderBookSelect();
+      addLog('定跡を追加登録しました。「設定を保存」で反映されます');
+    });
+
+    $('#btn-book-del').addEventListener('click', () => {
+      const b = draftBooks[selectedBookUri];
+      if (!b) return;
+      if (!confirm(`「${b.name}」を登録から削除しますか？（ファイル自体は削除されません）`)) return;
+      delete draftBooks[selectedBookUri];
+      selectedBookUri = Object.keys(draftBooks)[0] || '';
+      renderBookSelect();
+      addLog('定跡の登録を削除しました。「設定を保存」で確定します');
     });
 
     // Save
@@ -339,7 +396,9 @@
         enginePath: selected?.path || '',
         evalPath: selected?.evalPath || '',
         engineOptions: { ...(selected?.options || {}) },
-        bookPath: $('#cfg-book').value,
+        books: draftBooks,
+        defaultBookUri: selectedBookUri,
+        bookPath: draftBooks[selectedBookUri]?.path || '',
         useBook: activeConfig?.useBook === true,
         engineMode: $('#cfg-engine-ondemand').checked ? ENGINE_MODE_ON_DEMAND : ENGINE_MODE_ALWAYS,
       };

@@ -279,6 +279,13 @@ function queueAnalysisUpdate(multipv, payload) {
   }, INFO_THROTTLE_MS);
 }
 
+// カタログ行: uri+表示名のみ。パス・オプション値はローカル情報なので Web へ送らない
+function catalogEntries(map) {
+  return Object.values(map || {})
+    .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0) || String(a.name).localeCompare(String(b.name)))
+    .map((e) => ({ uri: e.uri, name: e.name }));
+}
+
 function emitEngineSettings() {
   if (currentConfig?.engineOptions && socket?.connected) {
     const activeEngine = currentConfig.engines?.[currentConfig.defaultEngineUri];
@@ -289,6 +296,14 @@ function emitEngineSettings() {
       UseBook: !!currentConfig.useBook,
       // 使用中エンジンの表示名(v6.4.0〜・登録簿)。同じく未知フィールドとして無害
       ...(activeEngine?.name ? { engineName: activeEngine.name } : {}),
+      // ★多エンジン化 Phase B(v6.5.0〜): 登録簿カタログ。ブラウザの詳細設定が
+      //   エンジン/定跡セレクタを出すのに使う(無ければ旧Connectorとして非表示)
+      activeEngineUri: currentConfig.defaultEngineUri || null,
+      activeBookUri: currentConfig.defaultBookUri || null,
+      catalog: {
+        engines: catalogEntries(currentConfig.engines),
+        books: catalogEntries(currentConfig.books),
+      },
       ...bookStatusForSync(),
     });
   }
@@ -622,6 +637,61 @@ function connectToServer(config) {
     markActivity();
     const { name, value } = data || {};
     if (typeof name !== 'string') return;
+
+    // ★EngineUri: 使用中エンジンの切替(v6.5.0〜・Connector疑似オプション)。
+    //   ブラウザのエンジンセレクタからのリモコン操作で、defaultEngineUri を書き換えて
+    //   保存→エンジン再起動(解析中なら再開)。エンジンへは送らない
+    if (name === 'EngineUri') {
+      const uri = String(value || '');
+      const prevCfg = normalizeConfig(currentConfig || normalizedConfig);
+      const entry = prevCfg.engines?.[uri];
+      if (!entry) {
+        log('エンジン切替: 登録が見つかりません — カタログを再同期します');
+        currentConfig = prevCfg;
+        emitEngineSettings();
+        return;
+      }
+      if (prevCfg.defaultEngineUri === uri) {
+        currentConfig = prevCfg;
+        emitEngineSettings();
+        return;
+      }
+      // defaultEngineUri を変えるときはフラット項目も新エンジンの値で渡す(config-schema の規約)
+      const nextCfg = normalizeConfig({
+        ...prevCfg,
+        defaultEngineUri: uri,
+        enginePath: entry.path,
+        evalPath: entry.evalPath,
+        engineOptions: { ...entry.options },
+      });
+      try { saveConfig(nextCfg); } catch (e) { log(`設定保存エラー: ${e.message}`); }
+      log(`エンジンを切り替えます: ${entry.name}`);
+      await applyConfigUpdate(nextCfg, prevCfg);
+      return;
+    }
+
+    // ★BookUri: 使用中定跡の切替(v6.5.0〜・Connector疑似オプション)。選ぶ=利用する
+    if (name === 'BookUri') {
+      const uri = String(value || '');
+      const prevCfg = normalizeConfig(currentConfig || normalizedConfig);
+      const entry = prevCfg.books?.[uri];
+      if (!entry) {
+        log('定跡切替: 登録が見つかりません — カタログを再同期します');
+        currentConfig = prevCfg;
+        emitEngineSettings();
+        return;
+      }
+      const nextCfg = normalizeConfig({
+        ...prevCfg,
+        defaultBookUri: uri,
+        bookPath: entry.path,
+        useBook: true, // 解除は従来どおり UseBook=false
+      });
+      try { saveConfig(nextCfg); } catch (e) { log(`設定保存エラー: ${e.message}`); }
+      log(`定跡を切り替えます: ${entry.name}`);
+      await applyConfigUpdate(nextCfg, prevCfg);
+      return;
+    }
 
     // ★UseBook はエンジンオプションではなく Connector 側の疑似オプション。
     //   エンジンへは送らず、設定として保存して同期だけ返す

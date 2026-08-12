@@ -142,10 +142,11 @@
           </div>
         </div>
         <div class="form-group">
-          <label for="cfg-book">定跡ファイル（.db / .ybb・任意）</label>
+          <label for="cfg-book-select">定跡ファイル（.db / .ybb・複数登録できます）</label>
           <div class="input-row">
-            <input type="text" id="cfg-book" readonly placeholder="未設定">
-            <button id="btn-select-book" class="btn-secondary btn-sm">参照...</button>
+            <select id="cfg-book-select" title="使用する定跡を選択"></select>
+            <button id="btn-book-add" class="btn-secondary btn-sm" title="定跡ファイルを追加登録">追加</button>
+            <button id="btn-book-del" class="btn-icon btn-sm" title="選択中の定跡を登録から削除">削除</button>
           </div>
         </div>
         <label class="check-option compact">

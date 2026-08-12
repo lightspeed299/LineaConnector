@@ -1,6 +1,6 @@
 {
   "name": "linea-connector",
-  "version": "6.4.0",
+  "version": "6.5.0",
   "description": "Local USI engine connector for Linea analysis",
   "author": "lightspeed299",
   "main": "main.js",

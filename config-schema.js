@@ -71,13 +71,26 @@ function stableEngineOptions(options) {
 }
 
 // 登録簿キー。時刻+乱数の不透明ID（一意性が目的で秘匿性は不要）
+function generateUri(kind, now = Date.now()) {
+  return `le://${kind}/${now}/${crypto.randomBytes(4).toString('hex')}`;
+}
+
 function generateEngineUri(now = Date.now()) {
-  return `le://engine/${now}/${crypto.randomBytes(4).toString('hex')}`;
+  return generateUri('engine', now);
+}
+
+function generateBookUri(now = Date.now()) {
+  return generateUri('book', now);
 }
 
 function engineDisplayNameFromPath(enginePath) {
   const base = normalizePathForCompare(enginePath).split('/').filter(Boolean).pop() || '';
   return base.replace(/\.(exe|bat|cmd)$/i, '') || 'エンジン';
+}
+
+// 定跡の表示名は拡張子込みのファイル名（.db/.ybb の区別が情報になる）
+function bookDisplayNameFromPath(bookPath) {
+  return normalizePathForCompare(bookPath).split('/').filter(Boolean).pop() || '定跡';
 }
 
 // 登録エントリの型崩れ対策。未知フィールドは温存する（前方互換）
@@ -103,6 +116,19 @@ function engineFieldsDiffer(entry, flat) {
     normalizePathForCompare(entry.evalPath) !== normalizePathForCompare(flat.evalPath) ||
     stableEngineOptions(entry.options) !== stableEngineOptions(flat.engineOptions)
   );
+}
+
+// 定跡エントリ。プロセス寿命がないためエンジンより薄い（名前はファイル名固定）
+function sanitizeBookEntry(uri, entry) {
+  const src = entry && typeof entry === 'object' ? entry : {};
+  const bookPath = String(src.path || '');
+  return {
+    ...src,
+    uri,
+    name: bookDisplayNameFromPath(bookPath),
+    path: bookPath,
+    ...(typeof src.createdAt === 'number' ? { createdAt: src.createdAt } : {}),
+  };
 }
 
 function normalizeConfig(config) {
@@ -155,8 +181,39 @@ function normalizeConfig(config) {
     });
   }
 
-  // ミラー: フラット項目は常に使用中エンジンの写し
+  // --- 定跡登録簿（v6.5.0〜）: エンジンと同じ「登録簿+フラットミラー」パターン ---
+  const books = {};
+  if (config?.books && typeof config.books === 'object') {
+    for (const [uri, entry] of Object.entries(config.books)) {
+      if (typeof uri === 'string' && uri && entry && typeof entry === 'object') {
+        books[uri] = sanitizeBookEntry(uri, entry);
+      }
+    }
+  }
+  let defaultBookUri =
+    typeof config?.defaultBookUri === 'string' && books[config.defaultBookUri]
+      ? config.defaultBookUri
+      : Object.keys(books)[0] || '';
+
+  // 移行: 登録簿が空でフラットに定跡パスがあれば 1 件目として合成
+  if (!defaultBookUri && base.bookPath) {
+    const uri = generateBookUri();
+    books[uri] = sanitizeBookEntry(uri, { path: base.bookPath, createdAt: Date.now() });
+    defaultBookUri = uri;
+  }
+
+  // 同期: フラット bookPath がズレていたらフラット優先で使用中エントリへ取り込む
+  const activeBook = books[defaultBookUri];
+  if (
+    activeBook && base.bookPath &&
+    normalizePathForCompare(activeBook.path) !== normalizePathForCompare(base.bookPath)
+  ) {
+    books[defaultBookUri] = sanitizeBookEntry(defaultBookUri, { ...activeBook, path: base.bookPath });
+  }
+
+  // ミラー: フラット項目は常に使用中エンジン/定跡の写し
   const mirrored = engines[defaultEngineUri];
+  const mirroredBook = books[defaultBookUri];
   return {
     ...base,
     ...(mirrored
@@ -166,8 +223,13 @@ function normalizeConfig(config) {
           engineOptions: { ...mirrored.options },
         }
       : {}),
+    // 定跡なし(全削除)は bookPath '' で表現される。呼び出し側は defaultBookUri を
+    // 変える/空にするとき bookPath も揃えて渡すこと（renderer は保存時にミラーを組む）
+    bookPath: mirroredBook ? mirroredBook.path : base.bookPath,
     engines,
     defaultEngineUri,
+    books,
+    defaultBookUri,
   };
 }
 
@@ -183,7 +245,10 @@ module.exports = {
   normalizePathForCompare,
   stableEngineOptions,
   generateEngineUri,
+  generateBookUri,
   engineDisplayNameFromPath,
+  bookDisplayNameFromPath,
   sanitizeEngineEntry,
+  sanitizeBookEntry,
   normalizeConfig,
 };

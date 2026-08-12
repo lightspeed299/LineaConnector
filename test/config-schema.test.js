@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const {
   normalizeConfig,
   generateEngineUri,
+  generateBookUri,
   engineDisplayNameFromPath,
   DEFAULT_SERVER_URL,
 } = require('../config-schema.js');
@@ -145,6 +146,45 @@ test('レガシーserverUrlはデフォルトへ置換される(回帰)', () => 
   const legacyKey = Buffer.from('c2hvZ2lzdGFjaw==', 'base64').toString('utf8');
   const c = normalizeConfig({ ...FLAT, serverUrl: `https://${legacyKey}-server.onrender.com` });
   assert.equal(c.serverUrl, DEFAULT_SERVER_URL);
+});
+
+test('定跡: 旧形式(bookPath)から登録簿1件を合成し、フラットはミラー・冪等', () => {
+  const c = normalizeConfig({ ...FLAT, bookPath: 'C:/books/user_book1.db' });
+  assert.equal(Object.keys(c.books).length, 1);
+  const uri = c.defaultBookUri;
+  assert.match(uri, /^le:\/\/book\/\d+\/[0-9a-f]{8}$/);
+  assert.equal(c.books[uri].name, 'user_book1.db');
+  assert.equal(c.bookPath, 'C:/books/user_book1.db');
+  const c2 = normalizeConfig(c);
+  assert.deepEqual(c2, c);
+});
+
+test('定跡: 切替と全削除(bookPath空)が表現できる', () => {
+  const c1 = normalizeConfig({ ...FLAT, bookPath: 'C:/books/a.db' });
+  const uriB = generateBookUri();
+  const withB = normalizeConfig({
+    ...c1,
+    books: { ...c1.books, [uriB]: { uri: uriB, path: 'C:/books/b.ybb' } },
+    defaultBookUri: uriB,
+    bookPath: 'C:/books/b.ybb',
+  });
+  assert.equal(withB.defaultBookUri, uriB);
+  assert.equal(withB.bookPath, 'C:/books/b.ybb');
+  assert.equal(withB.books[uriB].name, 'b.ybb');
+  assert.equal(withB.books[c1.defaultBookUri].path, 'C:/books/a.db'); // 旧エントリは無傷
+  // 全削除: books空+bookPath空なら勝手に復活しない
+  const cleared = normalizeConfig({ ...withB, books: {}, defaultBookUri: '', bookPath: '' });
+  assert.deepEqual(cleared.books, {});
+  assert.equal(cleared.bookPath, '');
+  assert.equal(cleared.defaultBookUri, '');
+});
+
+test('定跡: 旧バージョンで bookPath だけ変更→使用中エントリへ取り込む(名前も追随)', () => {
+  const c1 = normalizeConfig({ ...FLAT, bookPath: 'C:/books/a.db' });
+  const drifted = normalizeConfig({ ...c1, bookPath: 'C:/books/new.db' });
+  assert.equal(drifted.defaultBookUri, c1.defaultBookUri);
+  assert.equal(drifted.books[drifted.defaultBookUri].path, 'C:/books/new.db');
+  assert.equal(drifted.books[drifted.defaultBookUri].name, 'new.db');
 });
 
 test('generateEngineUri/表示名ヘルパー', () => {
