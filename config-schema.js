@@ -1,0 +1,189 @@
+'use strict';
+// Linea Connector — 設定スキーマ（v2: エンジン登録簿）
+//
+// Electron 非依存。normalizeConfig() が設定の唯一の正規化窓口で、ここで
+//   1) 旧形式（単一 enginePath）→ 登録簿形式への移行
+//   2) フラット項目（enginePath/evalPath/engineOptions）と登録簿の同期
+// を行う。
+//
+// 設計（docs/research/shogihome.md §3.6 の最小実装 = Phase A）:
+// - 登録簿のキーは不透明 URI（ShogiHome の es:// と同型）。パスでは一意化しない。
+//   同じ実行ファイルを設定違い（評価関数・オプション）で何本でも登録できることが価値。
+// - フラット項目は常に「使用中エンジン（defaultEngineUri）の写し」として保存する。
+//   旧バージョンへロールバックしても壊れない（additive スキーマ）ためと、
+//   main.js の既存コード（startEngine / hasEngineConfigChanged / set_engine_option）を
+//   変えずに済ませるため。
+// - フラット項目が使用中エントリとズレていたら「フラット優先」で使用中エントリへ
+//   取り込む（旧バージョンで設定変更→再アップデートのケース）。自動で別エントリへ
+//   乗り換えたりはしない。呼び出し側は defaultEngineUri を変えるとき、フラット項目も
+//   新エンジンの値で渡すこと（renderer は保存時にミラーを組んで送る）。
+
+const crypto = require('crypto');
+
+const DEFAULT_SERVER_URL = 'https://api.lineashogi.com';
+
+function decodeLegacyValue(value) {
+  return Buffer.from(value, 'base64').toString('utf8');
+}
+const LEGACY_PRODUCT_KEY = decodeLegacyValue('c2hvZ2lzdGFjaw==');
+const LEGACY_PRODUCT_TITLE = decodeLegacyValue('U2hvZ2lTdGFjaw==');
+const LEGACY_SERVER_URLS = new Set([
+  `https://${LEGACY_PRODUCT_KEY}-server.onrender.com`,
+  `http://${LEGACY_PRODUCT_KEY}-server.onrender.com`,
+]);
+
+const ENGINE_MODE_ALWAYS = 'always';
+const ENGINE_MODE_ON_DEMAND = 'onDemand';
+
+function getEngineMode(config) {
+  return config?.engineMode === ENGINE_MODE_ON_DEMAND ? ENGINE_MODE_ON_DEMAND : ENGINE_MODE_ALWAYS;
+}
+
+function normalizeServerUrl(value) {
+  const serverUrl = String(value || '').trim().replace(/\/+$/, '');
+  if (!serverUrl || LEGACY_SERVER_URLS.has(serverUrl)) {
+    return DEFAULT_SERVER_URL;
+  }
+  return serverUrl;
+}
+
+// 旧キー fv_scale(小文字)を FV_SCALE へ移行する。
+// USIオプション名は宣言と突き合わせて解決されるため実害は少ないが、表記を正に統一する。
+function normalizeEngineOptions(options) {
+  const src = { ...(options || {}) };
+  if (src.fv_scale !== undefined && src.FV_SCALE === undefined) {
+    src.FV_SCALE = src.fv_scale;
+  }
+  delete src.fv_scale;
+  return src;
+}
+
+function normalizePathForCompare(value) {
+  return String(value || '').replace(/\\/g, '/');
+}
+
+function stableEngineOptions(options) {
+  return JSON.stringify(
+    Object.entries(options || {})
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, value]) => [key, String(value)])
+  );
+}
+
+// 登録簿キー。時刻+乱数の不透明ID（一意性が目的で秘匿性は不要）
+function generateEngineUri(now = Date.now()) {
+  return `le://engine/${now}/${crypto.randomBytes(4).toString('hex')}`;
+}
+
+function engineDisplayNameFromPath(enginePath) {
+  const base = normalizePathForCompare(enginePath).split('/').filter(Boolean).pop() || '';
+  return base.replace(/\.(exe|bat|cmd)$/i, '') || 'エンジン';
+}
+
+// 登録エントリの型崩れ対策。未知フィールドは温存する（前方互換）
+function sanitizeEngineEntry(uri, entry) {
+  const src = entry && typeof entry === 'object' ? entry : {};
+  const enginePath = String(src.path || '');
+  return {
+    ...src,
+    uri,
+    name: String(src.name || '') || engineDisplayNameFromPath(enginePath),
+    path: enginePath,
+    evalPath: String(src.evalPath || ''),
+    options: normalizeEngineOptions(src.options),
+    ...(src.defaultName !== undefined ? { defaultName: String(src.defaultName || '') } : {}),
+    ...(src.author !== undefined ? { author: String(src.author || '') } : {}),
+    ...(typeof src.createdAt === 'number' ? { createdAt: src.createdAt } : {}),
+  };
+}
+
+function engineFieldsDiffer(entry, flat) {
+  return (
+    normalizePathForCompare(entry.path) !== normalizePathForCompare(flat.enginePath) ||
+    normalizePathForCompare(entry.evalPath) !== normalizePathForCompare(flat.evalPath) ||
+    stableEngineOptions(entry.options) !== stableEngineOptions(flat.engineOptions)
+  );
+}
+
+function normalizeConfig(config) {
+  const base = {
+    ...config,
+    serverUrl: normalizeServerUrl(config?.serverUrl),
+    engineMode: getEngineMode(config),
+    engineOptions: normalizeEngineOptions(config?.engineOptions),
+    enginePath: String(config?.enginePath || ''),
+    evalPath: String(config?.evalPath || ''),
+    bookPath: String(config?.bookPath || ''),
+    useBook: config?.useBook === true || config?.useBook === 'true',
+  };
+
+  // --- エンジン登録簿（v2） ---
+  const engines = {};
+  if (config?.engines && typeof config.engines === 'object') {
+    for (const [uri, entry] of Object.entries(config.engines)) {
+      if (typeof uri === 'string' && uri && entry && typeof entry === 'object') {
+        engines[uri] = sanitizeEngineEntry(uri, entry);
+      }
+    }
+  }
+  let defaultEngineUri =
+    typeof config?.defaultEngineUri === 'string' && engines[config.defaultEngineUri]
+      ? config.defaultEngineUri
+      : Object.keys(engines)[0] || '';
+
+  // 移行: 登録簿が空でフラットにエンジンがあれば 1 件目として合成
+  if (!defaultEngineUri && base.enginePath) {
+    const uri = generateEngineUri();
+    engines[uri] = sanitizeEngineEntry(uri, {
+      name: engineDisplayNameFromPath(base.enginePath),
+      path: base.enginePath,
+      evalPath: base.evalPath,
+      options: base.engineOptions,
+      createdAt: Date.now(),
+    });
+    defaultEngineUri = uri;
+  }
+
+  // 同期: フラット項目がズレていたらフラット優先で使用中エントリへ取り込む
+  const active = engines[defaultEngineUri];
+  if (active && base.enginePath && engineFieldsDiffer(active, base)) {
+    engines[defaultEngineUri] = sanitizeEngineEntry(defaultEngineUri, {
+      ...active,
+      path: base.enginePath,
+      evalPath: base.evalPath,
+      options: base.engineOptions,
+    });
+  }
+
+  // ミラー: フラット項目は常に使用中エンジンの写し
+  const mirrored = engines[defaultEngineUri];
+  return {
+    ...base,
+    ...(mirrored
+      ? {
+          enginePath: mirrored.path,
+          evalPath: mirrored.evalPath,
+          engineOptions: { ...mirrored.options },
+        }
+      : {}),
+    engines,
+    defaultEngineUri,
+  };
+}
+
+module.exports = {
+  DEFAULT_SERVER_URL,
+  LEGACY_PRODUCT_KEY,
+  LEGACY_PRODUCT_TITLE,
+  ENGINE_MODE_ALWAYS,
+  ENGINE_MODE_ON_DEMAND,
+  getEngineMode,
+  normalizeServerUrl,
+  normalizeEngineOptions,
+  normalizePathForCompare,
+  stableEngineOptions,
+  generateEngineUri,
+  engineDisplayNameFromPath,
+  sanitizeEngineEntry,
+  normalizeConfig,
+};

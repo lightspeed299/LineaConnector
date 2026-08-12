@@ -107,17 +107,38 @@
           </div>
         </div>
         <div class="form-group">
-          <label for="cfg-engine">エンジン</label>
+          <label for="cfg-engine-select">エンジン（複数登録できます・選択して保存で切替）</label>
           <div class="input-row">
-            <input type="text" id="cfg-engine" readonly>
-            <button id="btn-select-engine" class="btn-secondary btn-sm">参照...</button>
+            <select id="cfg-engine-select" title="使用するエンジンを選択"></select>
+            <button id="btn-engine-add" class="btn-secondary btn-sm" title="別のエンジンを追加登録">追加</button>
+            <button id="btn-engine-dup" class="btn-icon btn-sm" title="選択中のエンジンを複製（評価関数違いの登録に便利）">複製</button>
+            <button id="btn-engine-del" class="btn-icon btn-sm" title="選択中のエンジンを登録から削除">削除</button>
           </div>
         </div>
-        <div class="form-group">
-          <label for="cfg-eval">評価関数（エンジン選択時に自動検出・変更可）</label>
-          <div class="input-row">
-            <input type="text" id="cfg-eval" readonly placeholder="エンジンを選択すると自動入力されます">
-            <button id="btn-select-eval" class="btn-secondary btn-sm">参照...</button>
+        <div class="engine-entry-box">
+          <div class="form-group">
+            <label for="cfg-engine-name">表示名</label>
+            <input type="text" id="cfg-engine-name" placeholder="例: 水匠5" spellcheck="false" autocomplete="off">
+          </div>
+          <div class="form-group">
+            <label for="cfg-engine">実行ファイル</label>
+            <div class="input-row">
+              <input type="text" id="cfg-engine" readonly>
+              <button id="btn-select-engine" class="btn-secondary btn-sm">参照...</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="cfg-eval">評価関数（エンジン選択時に自動検出・変更可）</label>
+            <div class="input-row">
+              <input type="text" id="cfg-eval" readonly placeholder="エンジンを選択すると自動入力されます">
+              <button id="btn-select-eval" class="btn-secondary btn-sm">参照...</button>
+            </div>
+          </div>
+          <div class="options-grid compact">
+            <label>Threads<input type="number" id="cfg-threads" min="1" max="128"></label>
+            <label>Hash (MB)<input type="number" id="cfg-hash" min="16" max="65536"></label>
+            <label>MultiPV<input type="number" id="cfg-multipv" min="1" max="10"></label>
+            <label>FV_SCALE<input type="number" id="cfg-fvscale" min="1" max="128"></label>
           </div>
         </div>
         <div class="form-group">
@@ -126,12 +147,6 @@
             <input type="text" id="cfg-book" readonly placeholder="未設定">
             <button id="btn-select-book" class="btn-secondary btn-sm">参照...</button>
           </div>
-        </div>
-        <div class="options-grid compact">
-          <label>Threads<input type="number" id="cfg-threads" min="1" max="128"></label>
-          <label>Hash (MB)<input type="number" id="cfg-hash" min="16" max="65536"></label>
-          <label>MultiPV<input type="number" id="cfg-multipv" min="1" max="10"></label>
-          <label>FV_SCALE<input type="number" id="cfg-fvscale" min="1" max="128"></label>
         </div>
         <label class="check-option compact">
           <input type="checkbox" id="cfg-engine-ondemand">

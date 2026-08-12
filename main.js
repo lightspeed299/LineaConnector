@@ -9,18 +9,17 @@ const { UsiEngine } = require('./usi-engine');
 const { openBook } = require('./book');
 
 const CURRENT_VERSION = `v${require('./package.json').version}`;
-const DEFAULT_SERVER_URL = 'https://api.lineashogi.com';
-function decodeLegacyValue(value) {
-  return Buffer.from(value, 'base64').toString('utf8');
-}
-const LEGACY_PRODUCT_KEY = decodeLegacyValue('c2hvZ2lzdGFjaw==');
-const LEGACY_PRODUCT_TITLE = decodeLegacyValue('U2hvZ2lTdGFjaw==');
-const LEGACY_SERVER_URLS = new Set([
-  `https://${LEGACY_PRODUCT_KEY}-server.onrender.com`,
-  `http://${LEGACY_PRODUCT_KEY}-server.onrender.com`,
-]);
-const ENGINE_MODE_ALWAYS = 'always';
-const ENGINE_MODE_ON_DEMAND = 'onDemand';
+// 設定の正規化・エンジン登録簿(v2)・レガシー移行は config-schema.js に集約
+const {
+  DEFAULT_SERVER_URL,
+  LEGACY_PRODUCT_KEY,
+  LEGACY_PRODUCT_TITLE,
+  ENGINE_MODE_ON_DEMAND,
+  getEngineMode,
+  normalizeConfig,
+  normalizePathForCompare,
+  stableEngineOptions,
+} = require('./config-schema');
 const ENGINE_IDLE_SHUTDOWN_DELAY_MS = 3000;
 const UPDATE_CHECK_INITIAL_DELAY_MS = 5 * 1000;
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -47,41 +46,6 @@ function getConnectorIdentity() {
     deviceName: sanitizeDeviceMeta(os.hostname(), 'Windows PC', 64),
     platform: sanitizeDeviceMeta(`${os.type()} ${os.arch()}`, 'Windows', 32),
     version: CURRENT_VERSION,
-  };
-}
-
-function getEngineMode(config) {
-  return config?.engineMode === ENGINE_MODE_ON_DEMAND ? ENGINE_MODE_ON_DEMAND : ENGINE_MODE_ALWAYS;
-}
-
-function normalizeServerUrl(value) {
-  const serverUrl = String(value || '').trim().replace(/\/+$/, '');
-  if (!serverUrl || LEGACY_SERVER_URLS.has(serverUrl)) {
-    return DEFAULT_SERVER_URL;
-  }
-  return serverUrl;
-}
-
-// 旧キー fv_scale(小文字)を FV_SCALE へ移行する。
-// USIオプション名は宣言と突き合わせて解決されるため実害は少ないが、表記を正に統一する。
-function normalizeEngineOptions(options) {
-  const src = { ...(options || {}) };
-  if (src.fv_scale !== undefined && src.FV_SCALE === undefined) {
-    src.FV_SCALE = src.fv_scale;
-  }
-  delete src.fv_scale;
-  return src;
-}
-
-function normalizeConfig(config) {
-  return {
-    ...config,
-    serverUrl: normalizeServerUrl(config?.serverUrl),
-    engineMode: getEngineMode(config),
-    engineOptions: normalizeEngineOptions(config?.engineOptions),
-    bookPath: String(config?.bookPath || ''),
-    useBook: config?.useBook === true || config?.useBook === 'true',
-    evalPath: String(config?.evalPath || ''),
   };
 }
 
@@ -317,11 +281,14 @@ function queueAnalysisUpdate(multipv, payload) {
 
 function emitEngineSettings() {
   if (currentConfig?.engineOptions && socket?.connected) {
+    const activeEngine = currentConfig.engines?.[currentConfig.defaultEngineUri];
     socket.emit('connector_engine_settings', {
       Threads: currentConfig.engineOptions.Threads,
       MultiPV: currentConfig.engineOptions.MultiPV,
       // 定跡設定(v6.1.0〜)。サーバーは素通し・旧クライアントは未知フィールドを無視する
       UseBook: !!currentConfig.useBook,
+      // 使用中エンジンの表示名(v6.4.0〜・登録簿)。同じく未知フィールドとして無害
+      ...(activeEngine?.name ? { engineName: activeEngine.name } : {}),
       ...bookStatusForSync(),
     });
   }
@@ -344,18 +311,6 @@ function scheduleEngineIdleShutdown() {
     await stopEngineProcess();
     sendStatus(buildStatus(!!socket?.connected, false));
   }, ENGINE_IDLE_SHUTDOWN_DELAY_MS);
-}
-
-function normalizePathForCompare(value) {
-  return String(value || '').replace(/\\/g, '/');
-}
-
-function stableEngineOptions(options) {
-  return JSON.stringify(
-    Object.entries(options || {})
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([key, value]) => [key, String(value)])
-  );
 }
 
 function hasConnectionConfigChanged(prevConfig, nextConfig) {
@@ -822,6 +777,18 @@ async function startEngine(config) {
       const res = await e.launch();
       if (engine !== e) return false; // 起動待ちの間に破棄された
       log(`エンジン準備完了: ${res.id.name || path.basename(enginePath)}`);
+      // 登録簿の使用中エントリへ USI id name/author を記録する(表示・将来のカタログ同期用)
+      try {
+        const uri = currentConfig?.defaultEngineUri;
+        const entry = uri ? currentConfig?.engines?.[uri] : null;
+        const idName = String(res.id.name || '');
+        const idAuthor = String(res.id.author || '');
+        if (entry && (entry.defaultName !== idName || entry.author !== idAuthor)) {
+          entry.defaultName = idName;
+          entry.author = idAuthor;
+          saveConfig(currentConfig);
+        }
+      } catch (_) { /* 記録失敗は無害 */ }
       if (res.report.eval) {
         if (res.report.eval.applied) {
           log(`評価関数を適用: ${res.report.eval.applied.name} = ${res.report.eval.applied.value}`);

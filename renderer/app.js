@@ -21,6 +21,15 @@
     if (hEl) { hEl.max = maxH; hEl.title = `最大 ${maxH} MB (搭載メモリの75%)`; }
   }
 
+  // ===== エンジン登録簿（v6.4.0〜）の編集状態 =====
+  // 「設定を保存」までのローカル編集ドラフト。保存時に engines + defaultEngineUri と
+  // 使用中エンジンのミラー(フラット項目)を main へ渡す。
+  // ※起動直後の showMain() から使うため、宣言は起動分岐より前に置くこと(TDZ回避)
+  let draftEngines = {};
+  let selectedUri = '';
+  let activeConfig = null;
+  const DEFAULT_ENGINE_OPTIONS = { Threads: 4, USI_Hash: 1024, MultiPV: 3, FV_SCALE: 24 };
+
   // 設定があればメイン画面、なければウィザード
   if (config && config.apiKey && config.enginePath) {
     showMain(config);
@@ -72,8 +81,9 @@
         }
       };
       await window.connector.saveConfig(newConfig);
-      showMain(newConfig);
-      window.connector.connect(newConfig);
+      // 保存時にエンジン登録簿(v2)形式へ移行されるため、正規化済み設定を読み直して表示する
+      const savedConfig = (await window.connector.getConfig()) || newConfig;
+      showMain(savedConfig); // showMain が自動接続する
     });
   }
 
@@ -113,26 +123,75 @@
     }
   }
 
+  function generateEngineUri() {
+    // main側 config-schema.js と同形式(le://engine/...)。一意性だけが目的
+    return `le://engine/${Date.now()}/${Math.random().toString(16).slice(2, 10)}`;
+  }
+
+  function engineDisplayNameFromPath(p) {
+    const base = String(p || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || '';
+    return base.replace(/\.(exe|bat|cmd)$/i, '') || 'エンジン';
+  }
+
   function populateSettings(cfg) {
     $('#cfg-apikey').value = cfg.apiKey || '';
-    $('#cfg-engine').value = cfg.enginePath || '';
-    $('#cfg-eval').value = cfg.evalPath || '';
     $('#cfg-book').value = cfg.bookPath || '';
-    // 評価関数が未設定なら、エンジンから自動検出して初期値として埋める(保存で確定)
-    if (!cfg.evalPath && cfg.enginePath) {
-      void autofillEvalFromEngine(cfg.enginePath, { quiet: true });
-    }
-    const opts = cfg.engineOptions || {};
-    $('#cfg-threads').value = opts.Threads || 4;
-    $('#cfg-hash').value = opts.USI_Hash || 1024;
-    $('#cfg-multipv').value = opts.MultiPV || 3;
-    $('#cfg-fvscale').value = opts.FV_SCALE || opts.fv_scale || 24;
     $('#cfg-engine-ondemand').checked = cfg.engineMode === ENGINE_MODE_ON_DEMAND;
 
-    if (cfg.enginePath) {
-      const name = cfg.enginePath.split('/').pop();
-      $('#engine-name').textContent = name;
+    draftEngines = JSON.parse(JSON.stringify(cfg.engines || {}));
+    selectedUri = cfg.defaultEngineUri && draftEngines[cfg.defaultEngineUri]
+      ? cfg.defaultEngineUri
+      : (Object.keys(draftEngines)[0] || '');
+    renderEngineSelect();
+    loadEngineFields();
+  }
+
+  function renderEngineSelect() {
+    const sel = $('#cfg-engine-select');
+    sel.innerHTML = '';
+    for (const [uri, e] of Object.entries(draftEngines)) {
+      const opt = document.createElement('option');
+      opt.value = uri;
+      opt.textContent = e.name || engineDisplayNameFromPath(e.path);
+      sel.appendChild(opt);
     }
+    if (selectedUri) sel.value = selectedUri;
+    $('#btn-engine-dup').disabled = !selectedUri;
+    $('#btn-engine-del').disabled = Object.keys(draftEngines).length <= 1;
+  }
+
+  // 選択中エントリの内容を編集欄へ展開する
+  function loadEngineFields() {
+    const e = draftEngines[selectedUri];
+    const opts = e?.options || {};
+    $('#cfg-engine-name').value = e?.name || '';
+    $('#cfg-engine').value = e?.path || '';
+    $('#cfg-eval').value = e?.evalPath || '';
+    $('#cfg-threads').value = opts.Threads || DEFAULT_ENGINE_OPTIONS.Threads;
+    $('#cfg-hash').value = opts.USI_Hash || DEFAULT_ENGINE_OPTIONS.USI_Hash;
+    $('#cfg-multipv').value = opts.MultiPV || DEFAULT_ENGINE_OPTIONS.MultiPV;
+    $('#cfg-fvscale').value = opts.FV_SCALE || opts.fv_scale || DEFAULT_ENGINE_OPTIONS.FV_SCALE;
+    $('#engine-name').textContent = e ? (e.name || engineDisplayNameFromPath(e.path)) : '—';
+    // 評価関数が未設定なら、エンジンから自動検出して初期値として埋める(保存で確定)
+    if (e && e.path && !e.evalPath) {
+      void autofillEvalFromEngine(e.path, { quiet: true });
+    }
+  }
+
+  // 編集欄の内容を選択中エントリへ書き戻す
+  function stashEngineFields() {
+    const e = draftEngines[selectedUri];
+    if (!e) return;
+    e.name = $('#cfg-engine-name').value.trim() || engineDisplayNameFromPath($('#cfg-engine').value);
+    e.path = $('#cfg-engine').value;
+    e.evalPath = $('#cfg-eval').value;
+    e.options = {
+      ...e.options,
+      Threads: parseInt($('#cfg-threads').value, 10) || DEFAULT_ENGINE_OPTIONS.Threads,
+      USI_Hash: parseInt($('#cfg-hash').value, 10) || DEFAULT_ENGINE_OPTIONS.USI_Hash,
+      MultiPV: parseInt($('#cfg-multipv').value, 10) || DEFAULT_ENGINE_OPTIONS.MultiPV,
+      FV_SCALE: parseInt($('#cfg-fvscale').value, 10) || DEFAULT_ENGINE_OPTIONS.FV_SCALE,
+    };
   }
 
   // ★エンジンに同梱された評価関数を検出して「評価関数」欄へ自動入力する
@@ -154,7 +213,7 @@
   }
 
   function setupMainHandlers(cfg) {
-    let activeConfig = { ...cfg };
+    activeConfig = { ...cfg };
 
     // API Key visibility toggle
     let keyVisible = false;
@@ -164,18 +223,85 @@
       $('#btn-toggle-key').textContent = keyVisible ? '非表示' : '表示';
     });
 
-    // Engine select
+    // ===== エンジン登録簿の操作 =====
+    $('#cfg-engine-select').addEventListener('change', (ev) => {
+      stashEngineFields(); // 直前まで編集していたエントリの内容を保持
+      selectedUri = ev.target.value;
+      renderEngineSelect(); // 改名を選択肢ラベルへ反映
+      loadEngineFields();
+      addLog('エンジンを切り替えるには「設定を保存」を押してください');
+    });
+
+    $('#cfg-engine-name').addEventListener('change', () => {
+      stashEngineFields();
+      renderEngineSelect();
+    });
+
+    $('#btn-engine-add').addEventListener('click', async () => {
+      const filePath = await window.connector.selectEngineFile();
+      if (!filePath) return;
+      stashEngineFields();
+      const uri = generateEngineUri();
+      draftEngines[uri] = {
+        uri,
+        name: engineDisplayNameFromPath(filePath),
+        path: filePath,
+        evalPath: '',
+        options: { ...DEFAULT_ENGINE_OPTIONS },
+        createdAt: Date.now(),
+      };
+      selectedUri = uri;
+      renderEngineSelect();
+      loadEngineFields();
+      addLog('エンジンを追加登録しました。「設定を保存」で切り替わります');
+    });
+
+    $('#btn-engine-dup').addEventListener('click', () => {
+      if (!draftEngines[selectedUri]) return;
+      stashEngineFields();
+      const src = draftEngines[selectedUri];
+      const uri = generateEngineUri();
+      draftEngines[uri] = JSON.parse(JSON.stringify({ ...src, uri, name: `${src.name}のコピー`, createdAt: Date.now() }));
+      selectedUri = uri;
+      renderEngineSelect();
+      loadEngineFields();
+      addLog('エンジンを複製しました。評価関数やオプションを変えて使い分けできます');
+    });
+
+    $('#btn-engine-del').addEventListener('click', () => {
+      const e = draftEngines[selectedUri];
+      if (!e) return;
+      if (Object.keys(draftEngines).length <= 1) {
+        addLog('⚠ 最後のエンジンは削除できません');
+        return;
+      }
+      if (!confirm(`「${e.name}」を登録から削除しますか？（ファイル自体は削除されません）`)) return;
+      delete draftEngines[selectedUri];
+      selectedUri = Object.keys(draftEngines)[0] || '';
+      renderEngineSelect();
+      loadEngineFields();
+      addLog('登録を削除しました。「設定を保存」で確定します');
+    });
+
+    // Engine executable select (選択中エントリの実行ファイル変更)
     $('#btn-select-engine').addEventListener('click', async () => {
       const filePath = await window.connector.selectEngineFile();
-      if (filePath) {
-        $('#cfg-engine').value = filePath;
-        $('#engine-name').textContent = filePath.split('/').pop();
-        // エンジンに合わせて評価関数欄も自動更新(変更したい場合は参照から)
-        const filled = await autofillEvalFromEngine(filePath);
-        if (!filled) {
-          $('#cfg-eval').value = '';
-        }
+      if (!filePath) return;
+      const nameField = $('#cfg-engine-name');
+      const prevAuto = engineDisplayNameFromPath($('#cfg-engine').value);
+      // 表示名が自動命名のままなら新しいパスに合わせる（手動の名前は尊重）
+      if (!nameField.value.trim() || nameField.value.trim() === prevAuto) {
+        nameField.value = engineDisplayNameFromPath(filePath);
       }
+      $('#cfg-engine').value = filePath;
+      $('#engine-name').textContent = nameField.value || engineDisplayNameFromPath(filePath);
+      // エンジンに合わせて評価関数欄も自動更新(変更したい場合は参照から)
+      const filled = await autofillEvalFromEngine(filePath);
+      if (!filled) {
+        $('#cfg-eval').value = '';
+      }
+      stashEngineFields();
+      renderEngineSelect();
     });
 
     // Eval select
@@ -202,20 +328,20 @@
       let hash = parseInt($('#cfg-hash').value, 10) || 1024;
       if (threads > maxThreads) { threads = maxThreads; $('#cfg-threads').value = threads; addLog(`Threadsを${maxThreads}に制限しました (CPUコア数上限)`); }
       if (hash > maxHashMB) { hash = maxHashMB; $('#cfg-hash').value = hash; addLog(`Hashを${maxHashMB}MBに制限しました (メモリ75%上限)`); }
+      stashEngineFields();
+      const selected = draftEngines[selectedUri];
       const updated = {
-        serverUrl: activeConfig.serverUrl || DEFAULT_SERVER_URL,
+        serverUrl: activeConfig?.serverUrl || DEFAULT_SERVER_URL,
         apiKey: $('#cfg-apikey').value,
-        enginePath: $('#cfg-engine').value,
-        evalPath: $('#cfg-eval').value,
+        // 登録簿(v2)。フラット項目は使用中エンジンのミラー(旧バージョン互換+main側の差分検出用)
+        engines: draftEngines,
+        defaultEngineUri: selectedUri,
+        enginePath: selected?.path || '',
+        evalPath: selected?.evalPath || '',
+        engineOptions: { ...(selected?.options || {}) },
         bookPath: $('#cfg-book').value,
-        useBook: activeConfig.useBook === true,
+        useBook: activeConfig?.useBook === true,
         engineMode: $('#cfg-engine-ondemand').checked ? ENGINE_MODE_ON_DEMAND : ENGINE_MODE_ALWAYS,
-        engineOptions: {
-          Threads: threads,
-          USI_Hash: hash,
-          MultiPV: parseInt($('#cfg-multipv').value, 10) || 3,
-          FV_SCALE: parseInt($('#cfg-fvscale').value, 10) || 24,
-        }
       };
       const result = await window.connector.saveConfig(updated);
       if (result?.ok) {
