@@ -40,15 +40,13 @@
       </div>
     </div>
 
-    <!-- Step 3: Options -->
+    <!-- Step 3: Options (Threads/MultiPVは自動設定・研究室から変更) -->
     <div id="wizard-step3" class="wizard-step hidden">
       <div class="step-badge">ステップ 3 / 3</div>
       <h2>基本設定</h2>
-      <p class="step-desc">あとから設定画面で変更できます。</p>
+      <p class="step-desc">あとから設定画面で変更できます。Threads と MultiPV は自動設定され、研究室（ブラウザ）から変更できます。</p>
       <div class="options-grid">
-        <label>Threads<input type="number" id="wizard-threads" value="4" min="1" max="128"></label>
         <label>Hash (MB)<input type="number" id="wizard-hash" value="1024" min="16" max="65536"></label>
-        <label>MultiPV<input type="number" id="wizard-multipv" value="3" min="1" max="10"></label>
         <label>FV_SCALE<input type="number" id="wizard-fvscale" value="24" min="1" max="128"></label>
       </div>
       <label class="check-option">
@@ -64,117 +62,130 @@
 
   <!-- ========== メイン画面 ========== -->
   <div id="main" class="hidden">
-    <!-- ツールバー -->
-    <header>
-      <div class="header-left">
-        <h1>Linea Connector</h1>
-        <span id="version" class="version"></span>
-      </div>
-      <div id="status-badge" class="status-badge offline">
-        <span class="status-dot"></span>
-        <span id="status-text">OFFLINE</span>
-      </div>
-    </header>
-
     <!-- アップデート通知 -->
     <div id="update-bar" class="update-bar hidden">
       <span id="update-msg"></span>
       <button id="btn-update" class="btn-update">ダウンロード</button>
     </div>
 
-    <!-- コンテンツ -->
     <div class="content-area">
-      <!-- 接続情報 -->
-      <section class="info-panel">
-        <div class="info-row">
-          <span class="info-label">エンジン</span>
-          <span id="engine-name" class="info-value">—</span>
+      <!-- 状態: 接続とエンジンの状態はここ1か所 -->
+      <section class="panel" id="status-panel" aria-label="接続とエンジンの状態">
+        <div class="hero-top">
+          <span id="conn-indicator" class="conn off"><span class="dot"></span><span id="conn-text">オフライン</span></span>
+          <span id="state-chip" class="chip"><span class="cdot"></span><span id="state-chip-text">停止</span></span>
         </div>
-        <div class="info-row">
-          <span class="info-label">エンジン状態</span>
-          <span id="engine-status" class="info-value">—</span>
+        <div id="st-engine-name" class="engine-title">—</div>
+        <div id="st-engine-sub" class="engine-sub"></div>
+
+        <div class="strip">
+          <!-- 解析中: ライブ統計 -->
+          <div id="strip-live" class="stats hidden">
+            <div class="stat"><div class="k">NPS</div><div class="v" id="live-nps">—</div></div>
+            <div class="stat"><div class="k">深さ</div><div class="v" id="live-depth">—</div></div>
+            <div class="stat"><div class="k">評価値</div><div class="v" id="live-score">—</div></div>
+          </div>
+          <!-- 全解析: 進捗バー -->
+          <div id="strip-batch" class="prog-row hidden">
+            <div class="prog"><i id="batch-fill" style="width:0%"></i></div>
+            <span class="prog-txt" id="batch-text"></span>
+          </div>
+          <!-- 待機中: 現在の主要設定(読み取り専用) -->
+          <div id="strip-idle" class="quiet-line hidden"></div>
+          <!-- オフライン -->
+          <div id="strip-offline" class="off-strip hidden">
+            <span id="offline-text">サーバーに接続していません</span>
+            <button id="btn-reconnect-hero" class="w-btn sm">再接続</button>
+          </div>
         </div>
       </section>
 
-      <!-- 設定 -->
-      <section class="settings-panel">
-        <h2>設定</h2>
-        <div class="form-group">
-          <label for="cfg-apikey">APIキー（再発行したら新しいキーを貼り付けて保存）</label>
-          <div class="input-row">
-            <input type="password" id="cfg-apikey" autocomplete="off" spellcheck="false">
-          </div>
-        </div>
-        <div class="form-group">
+      <!-- 設定: 使用頻度順(エンジン → 定跡 → 省メモリ → APIキー) -->
+      <section class="panel">
+        <h3>設定</h3>
+
+        <div class="fg">
           <label for="cfg-engine-select">エンジン（複数登録できます・選択して保存で切替）</label>
-          <div class="input-row">
+          <div class="row">
             <select id="cfg-engine-select" title="使用するエンジンを選択"></select>
-            <button id="btn-engine-add" class="btn-secondary btn-sm" title="別のエンジンを追加登録">追加</button>
-            <button id="btn-engine-dup" class="btn-icon btn-sm" title="選択中のエンジンを複製（評価関数違いの登録に便利）">複製</button>
-            <button id="btn-engine-del" class="btn-icon btn-sm" title="選択中のエンジンを登録から削除">削除</button>
+            <button id="btn-engine-add" class="w-btn" title="別のエンジンを追加登録">追加</button>
+            <button id="btn-engine-dup" class="w-btn" title="選択中のエンジンを複製（評価関数違いの登録に便利）">複製</button>
+            <button id="btn-engine-del" class="w-btn" title="選択中のエンジンを登録から削除">削除</button>
           </div>
-        </div>
-        <div class="engine-entry-box">
-          <div class="form-group">
-            <label for="cfg-engine-name">表示名</label>
-            <input type="text" id="cfg-engine-name" placeholder="例: 水匠5" spellcheck="false" autocomplete="off">
-          </div>
-          <div class="form-group">
-            <label for="cfg-engine">実行ファイル</label>
-            <div class="input-row">
-              <input type="text" id="cfg-engine" readonly>
-              <button id="btn-select-engine" class="btn-secondary btn-sm">参照...</button>
+
+          <div class="entry-box">
+            <div class="fg">
+              <label for="cfg-engine-name">表示名</label>
+              <input type="text" id="cfg-engine-name" placeholder="例: 水匠5" spellcheck="false" autocomplete="off">
+            </div>
+            <div class="fg">
+              <label for="cfg-engine">実行ファイル</label>
+              <div class="row">
+                <input type="text" id="cfg-engine" readonly>
+                <button id="btn-select-engine" class="w-btn">参照...</button>
+              </div>
+            </div>
+            <div class="fg">
+              <label for="cfg-eval">評価関数（エンジン選択時に自動検出・変更可）</label>
+              <div class="row">
+                <input type="text" id="cfg-eval" readonly placeholder="エンジンを選択すると自動入力されます">
+                <button id="btn-select-eval" class="w-btn">参照...</button>
+              </div>
+            </div>
+            <div class="grid-2">
+              <div class="fg">
+                <label for="cfg-hash">Hash (MB)</label>
+                <input type="number" id="cfg-hash" min="16" max="65536">
+              </div>
+              <div class="fg">
+                <label for="cfg-fvscale">FV_SCALE</label>
+                <input type="number" id="cfg-fvscale" min="1" max="128">
+              </div>
             </div>
           </div>
-          <div class="form-group">
-            <label for="cfg-eval">評価関数（エンジン選択時に自動検出・変更可）</label>
-            <div class="input-row">
-              <input type="text" id="cfg-eval" readonly placeholder="エンジンを選択すると自動入力されます">
-              <button id="btn-select-eval" class="btn-secondary btn-sm">参照...</button>
-            </div>
-          </div>
-          <div class="options-grid compact">
-            <label>Threads<input type="number" id="cfg-threads" min="1" max="128"></label>
-            <label>Hash (MB)<input type="number" id="cfg-hash" min="16" max="65536"></label>
-            <label>MultiPV<input type="number" id="cfg-multipv" min="1" max="10"></label>
-            <label>FV_SCALE<input type="number" id="cfg-fvscale" min="1" max="128"></label>
-          </div>
         </div>
-        <div class="form-group">
+
+        <div class="fg">
           <label for="cfg-book-select">定跡ファイル（.db / .ybb・複数登録できます）</label>
-          <div class="input-row">
+          <div class="row">
             <select id="cfg-book-select" title="使用する定跡を選択"></select>
-            <button id="btn-book-add" class="btn-secondary btn-sm" title="定跡ファイルを追加登録">追加</button>
-            <button id="btn-book-del" class="btn-icon btn-sm" title="選択中の定跡を登録から削除">削除</button>
+            <button id="btn-book-add" class="w-btn" title="定跡ファイルを追加登録">追加</button>
+            <button id="btn-book-del" class="w-btn" title="選択中の定跡を登録から削除">削除</button>
           </div>
           <!-- 定跡はファイル名が user_book1.db 等で衝突しやすいため、選択中のフルパスを常時表示 -->
-          <input type="text" id="cfg-book-path" class="stacked-path" readonly placeholder="未設定" title="選択中の定跡のフルパス">
+          <input type="text" id="cfg-book-path" class="pathline-input" readonly placeholder="未設定" title="選択中の定跡のフルパス">
         </div>
-        <label class="check-option compact">
+
+        <label class="check-row">
           <input type="checkbox" id="cfg-engine-ondemand">
           <span>省メモリモード（解析時のみエンジンを起動）</span>
         </label>
-        <div class="settings-actions">
-          <button id="btn-save" class="btn-primary btn-sm">設定を保存</button>
-          <button id="btn-reconnect" class="btn-secondary btn-sm">再接続</button>
+
+        <!-- APIキー: 初回と再発行時しか触らないので最下段の1行 -->
+        <div class="apikey-row">
+          <span>APIキー（再発行時のみ）</span>
+          <input type="password" id="cfg-apikey" autocomplete="off" spellcheck="false">
+        </div>
+
+        <div class="actions">
+          <span class="footnote">Threads・MultiPV は研究室（ブラウザ）の詳細パネルから変更します（このエンジンに保存されます）</span>
+          <button id="btn-reconnect" class="w-btn">再接続</button>
+          <button id="btn-save" class="w-btn primary">設定を保存</button>
         </div>
       </section>
 
       <!-- ログ -->
-      <section class="log-panel">
-        <div class="log-header">
-          <h2>ログ</h2>
-          <button id="btn-copy-usi" class="btn-icon btn-sm" title="エンジンとのUSI通信ログ(直近100件)をコピー">⚙ USI通信</button>
-          <button id="btn-copy-log" class="btn-icon btn-sm" title="ログをコピー">📋 コピー</button>
+      <section class="panel log-panel">
+        <div class="feed-head">
+          <h3>ログ</h3>
+          <button id="btn-verbose-log" class="w-btn sm" title="診断ログ([DIAG])も表示する" aria-pressed="false">詳細ログ</button>
+          <button id="btn-copy-usi" class="w-btn sm" title="エンジンとのUSI通信ログ(直近100件)をコピー">USI通信</button>
+          <button id="btn-copy-log" class="w-btn sm" title="ログ全体(診断ログ含む)をコピー">コピー</button>
         </div>
         <div id="log-container"></div>
       </section>
-    </div>
 
-    <!-- ステータスバー -->
-    <div class="status-bar">
-      <span class="status-bar-item" id="sb-connection">接続: —</span>
-      <span class="status-bar-item" id="sb-engine">エンジン: —</span>
+      <div class="version-line"><span id="version"></span></div>
     </div>
   </div>
 

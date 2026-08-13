@@ -35,6 +35,11 @@ contextBridge.exposeInMainWorld('connector', {
     ipcRenderer.removeAllListeners('status-update');
     ipcRenderer.on('status-update', (_, data) => callback(data));
   },
+  // ★Webからの切替(エンジン/定跡/オプション)を設定フォームへ即時反映(v6.7.0〜)
+  onConfigUpdated: (callback) => {
+    ipcRenderer.removeAllListeners('config-updated');
+    ipcRenderer.on('config-updated', (_, config) => callback(config));
+  },
   onLogMessage: (callback) => {
     ipcRenderer.removeAllListeners('log-message');
     ipcRenderer.on('log-message', (_, msg) => callback(msg));

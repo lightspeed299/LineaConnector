@@ -8,17 +8,16 @@
   const version = await window.connector.getVersion();
   const sysInfo = await window.connector.getSystemInfo();
 
-  // スレッド/Hash上限をシステム仕様に合わせる
-  const maxThreads = sysInfo.cpuCores;
+  // Hash上限をシステム仕様に合わせる(Threads/MultiPV欄はv6.7.0で廃止 — 研究室から変更)
   const maxHashMB = Math.floor(sysInfo.totalMemoryMB * 0.75); // メモリの75%まで
-  applyLimits('wizard-threads', 'wizard-hash', maxThreads, maxHashMB);
-  applyLimits('cfg-threads', 'cfg-hash', maxThreads, maxHashMB);
+  // 新規登録時の自動既定: UI応答用に2コア残す
+  const autoThreads = Math.max(1, (sysInfo.cpuCores || 4) - 2);
+  applyHashLimit('wizard-hash');
+  applyHashLimit('cfg-hash');
 
-  function applyLimits(threadsId, hashId, maxT, maxH) {
-    const tEl = $(`#${threadsId}`);
-    const hEl = $(`#${hashId}`);
-    if (tEl) { tEl.max = maxT; tEl.title = `最大 ${maxT} (CPU論理コア数)`; }
-    if (hEl) { hEl.max = maxH; hEl.title = `最大 ${maxH} MB (搭載メモリの75%)`; }
+  function applyHashLimit(id) {
+    const el = $(`#${id}`);
+    if (el) { el.max = maxHashMB; el.title = `最大 ${maxHashMB} MB (搭載メモリの75%)`; }
   }
 
   // ===== エンジン/定跡登録簿（v6.4.0〜/v6.5.0〜）の編集状態 =====
@@ -30,7 +29,12 @@
   let draftBooks = {};
   let selectedBookUri = '';
   let activeConfig = null;
-  const DEFAULT_ENGINE_OPTIONS = { Threads: 4, USI_Hash: 1024, MultiPV: 3, FV_SCALE: 24 };
+  // ★フォーム編集中フラグ: Webからの config-updated で編集中ドラフトを潰さないためのガード
+  let formDirty = false;
+  let engineSelectTouched = false; // このセッションでPC側がエンジン選択を触ったか
+  let bookSelectTouched = false;   // 同・定跡選択
+  let lastStatus = null;
+  const DEFAULT_ENGINE_OPTIONS = { Threads: autoThreads, USI_Hash: 1024, MultiPV: 3, FV_SCALE: 24 };
 
   // 設定があればメイン画面、なければウィザード
   if (config && config.apiKey && config.enginePath) {
@@ -67,7 +71,7 @@
     next2.addEventListener('click', () => showStep(3));
     $('#wizard-back2').addEventListener('click', () => showStep(1));
 
-    // Step 3: Options
+    // Step 3: Options（Threads/MultiPVは自動既定 — 研究室から変更できる）
     $('#wizard-back3').addEventListener('click', () => showStep(2));
     $('#wizard-finish').addEventListener('click', async () => {
       const newConfig = {
@@ -76,9 +80,9 @@
         enginePath: engineInput.value,
         engineMode: $('#wizard-engine-ondemand').checked ? ENGINE_MODE_ON_DEMAND : ENGINE_MODE_ALWAYS,
         engineOptions: {
-          Threads: parseInt($('#wizard-threads').value, 10) || 4,
+          Threads: autoThreads,
           USI_Hash: parseInt($('#wizard-hash').value, 10) || 1024,
-          MultiPV: parseInt($('#wizard-multipv').value, 10) || 3,
+          MultiPV: 3,
           FV_SCALE: parseInt($('#wizard-fvscale').value, 10) || 24,
         }
       };
@@ -103,10 +107,10 @@
     const result = await window.connector.checkEvalFiles(enginePath);
     if (result.ok) {
       statusEl.textContent = `評価関数を検出 (${result.type}): ${result.files.join(', ')}`;
-      statusEl.style.color = '#008000';
+      statusEl.style.color = '#107c10';
     } else {
       statusEl.textContent = '評価関数が見つかりません。エンジンと同じフォルダに配置してください。';
-      statusEl.style.color = '#cc6600';
+      statusEl.style.color = '#9a6700';
     }
   }
 
@@ -114,10 +118,11 @@
   function showMain(cfg) {
     $('#wizard').classList.add('hidden');
     $('#main').classList.remove('hidden');
-    $('#version').textContent = version;
+    $('#version').textContent = `Linea Connector ${version}`;
 
     populateSettings(cfg);
     setupMainHandlers(cfg);
+    renderStatus(lastStatus || { connected: false, engineRunning: false });
 
     // 既存設定があれば自動接続
     if (cfg.apiKey && cfg.enginePath) {
@@ -138,6 +143,10 @@
   // 定跡の表示名は拡張子込みのファイル名（.db/.ybb の区別が情報になる）
   function bookDisplayNameFromPath(p) {
     return String(p || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || '定跡';
+  }
+
+  function fileBaseName(p) {
+    return String(p || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || '';
   }
 
   // パス末尾の depth+1 セグメントをラベル化（config-schema.js の uniquifyBookNames と同ロジック。
@@ -185,7 +194,124 @@
       ? cfg.defaultBookUri
       : (Object.keys(draftBooks)[0] || '');
     renderBookSelect();
+
+    formDirty = false;
+    engineSelectTouched = false;
+    bookSelectTouched = false;
+    updateHero(cfg);
   }
+
+  // ===== 状態パネル =====
+
+  // 使用中エンジンの見出しとサブ行(id name · 評価関数 · 定跡)を activeConfig から描く
+  function updateHero(cfg) {
+    const c = cfg || activeConfig;
+    if (!c) return;
+    const entry = c.engines?.[c.defaultEngineUri];
+    const name = entry?.name || engineDisplayNameFromPath(c.enginePath) || '—';
+    $('#st-engine-name').textContent = name;
+    const parts = [];
+    if (entry?.defaultName && entry.defaultName !== name) parts.push(entry.defaultName);
+    const evalName = fileBaseName(c.evalPath || entry?.evalPath);
+    if (evalName) parts.push(evalName);
+    const activeBook = c.books?.[c.defaultBookUri];
+    if (c.useBook && activeBook?.name) parts.push(`定跡 ${activeBook.name}`);
+    $('#st-engine-sub').textContent = parts.join(' · ');
+  }
+
+  function fmtNps(nps) {
+    const n = Number(nps);
+    if (!Number.isFinite(n) || n <= 0) return '—';
+    if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+    if (n >= 1e3) return `${Math.round(n / 1e3)}k`;
+    return String(n);
+  }
+
+  // 評価値は研究室と同じ先手視点で表示する(USIは手番視点なので後手番なら符号反転)
+  function fmtScore(live) {
+    if (!live) return '—';
+    const flip = live.turn === 'w' || live.turn === 'white';
+    if (live.scoreMate !== undefined) {
+      const m = Number(live.scoreMate);
+      if (!Number.isFinite(m)) return '—';
+      if (Math.abs(m) >= 10000) return flip !== (m > 0) ? '詰みあり' : '被詰み';
+      const v = flip ? -m : m;
+      return `詰み ${v > 0 ? '+' : ''}${v}`;
+    }
+    if (live.scoreCP !== undefined) {
+      const v = Number(live.scoreCP);
+      if (!Number.isFinite(v)) return '—';
+      const s = flip ? -v : v;
+      return `${s > 0 ? '+' : ''}${s}`;
+    }
+    return '—';
+  }
+
+  function fmtRemaining(seconds) {
+    if (!Number.isFinite(seconds) || seconds <= 0) return '';
+    if (seconds < 90) return ` · 残り約${Math.max(1, Math.round(seconds))}秒`;
+    return ` · 残り約${Math.ceil(seconds / 60)}分`;
+  }
+
+  function setChip(text, tone) {
+    const chip = $('#state-chip');
+    chip.className = `chip${tone ? ` ${tone}` : ''}`;
+    $('#state-chip-text').textContent = text;
+  }
+
+  function renderStatus(status) {
+    lastStatus = status;
+    const conn = $('#conn-indicator');
+    const connected = !!status.connected;
+    conn.className = `conn ${connected ? 'on' : 'off'}`;
+    $('#conn-text').textContent = connected ? 'オンライン' : 'オフライン';
+
+    const showLive = connected && status.analyzing;
+    const showBatch = connected && !status.analyzing && !!status.batch;
+    const showIdle = connected && !showLive && !showBatch;
+    $('#strip-live').classList.toggle('hidden', !showLive);
+    $('#strip-batch').classList.toggle('hidden', !showBatch);
+    $('#strip-idle').classList.toggle('hidden', !showIdle);
+    $('#strip-offline').classList.toggle('hidden', connected);
+
+    if (!connected) {
+      setChip('切断', 'red');
+      return;
+    }
+
+    if (showLive) {
+      setChip('解析中', 'amber');
+      const live = status.live || {};
+      $('#live-nps').textContent = fmtNps(live.nps);
+      const d = live.depth !== undefined ? String(live.depth) : '—';
+      $('#live-depth').textContent = live.seldepth !== undefined ? `${d}/${live.seldepth}` : d;
+      $('#live-score').textContent = fmtScore(status.live);
+      return;
+    }
+
+    if (showBatch) {
+      const b = status.batch;
+      setChip(`全解析 ${b.done}/${b.total}`, 'amber');
+      const pct = b.total > 0 ? Math.min(100, Math.round((b.done / b.total) * 100)) : 0;
+      $('#batch-fill').style.width = `${pct}%`;
+      const remain = fmtRemaining((b.total - b.done) * (b.secondsPerMove || 3));
+      $('#batch-text').textContent = `${b.done}/${b.total} 局面 · ${b.secondsPerMove || 3}秒/手${remain}`;
+      return;
+    }
+
+    // 待機系
+    const isOnDemandIdle = !status.engineRunning && status.engineMode === ENGINE_MODE_ON_DEMAND;
+    setChip(status.engineRunning ? '待機中' : (isOnDemandIdle ? '省メモリ待機' : '停止'), '');
+    const o = status.options || {};
+    const bits = [];
+    if (o.Threads !== undefined) bits.push(`Threads <b>${o.Threads}</b>`);
+    if (o.MultiPV !== undefined) bits.push(`MultiPV <b>${o.MultiPV}</b>`);
+    if (o.hashMB !== undefined) bits.push(`Hash <b>${o.hashMB} MB</b>`);
+    const suffix = status.engineRunning ? ' — リクエスト待ち' : '';
+    $('#strip-idle').innerHTML = bits.length > 0 ? `${bits.join(' · ')}${suffix}` : (suffix || '&nbsp;');
+  }
+
+  // ===== 設定フォーム =====
 
   function renderBookSelect() {
     const sel = $('#cfg-book-select');
@@ -237,11 +363,8 @@
     $('#cfg-engine-name').value = e?.name || '';
     $('#cfg-engine').value = e?.path || '';
     $('#cfg-eval').value = e?.evalPath || '';
-    $('#cfg-threads').value = opts.Threads || DEFAULT_ENGINE_OPTIONS.Threads;
     $('#cfg-hash').value = opts.USI_Hash || DEFAULT_ENGINE_OPTIONS.USI_Hash;
-    $('#cfg-multipv').value = opts.MultiPV || DEFAULT_ENGINE_OPTIONS.MultiPV;
     $('#cfg-fvscale').value = opts.FV_SCALE || opts.fv_scale || DEFAULT_ENGINE_OPTIONS.FV_SCALE;
-    $('#engine-name').textContent = e ? (e.name || engineDisplayNameFromPath(e.path)) : '—';
     // 評価関数が未設定なら、エンジンから自動検出して初期値として埋める(保存で確定)
     if (e && e.path && !e.evalPath) {
       void autofillEvalFromEngine(e.path, { quiet: true });
@@ -249,6 +372,7 @@
   }
 
   // 編集欄の内容を選択中エントリへ書き戻す
+  // ※Threads/MultiPVの欄は無い — 既存値を温存する(研究室からの変更が正)
   function stashEngineFields() {
     const e = draftEngines[selectedUri];
     if (!e) return;
@@ -257,11 +381,11 @@
     e.evalPath = $('#cfg-eval').value;
     e.options = {
       ...e.options,
-      Threads: parseInt($('#cfg-threads').value, 10) || DEFAULT_ENGINE_OPTIONS.Threads,
       USI_Hash: parseInt($('#cfg-hash').value, 10) || DEFAULT_ENGINE_OPTIONS.USI_Hash,
-      MultiPV: parseInt($('#cfg-multipv').value, 10) || DEFAULT_ENGINE_OPTIONS.MultiPV,
       FV_SCALE: parseInt($('#cfg-fvscale').value, 10) || DEFAULT_ENGINE_OPTIONS.FV_SCALE,
     };
+    if (e.options.Threads === undefined) e.options.Threads = DEFAULT_ENGINE_OPTIONS.Threads;
+    if (e.options.MultiPV === undefined) e.options.MultiPV = DEFAULT_ENGINE_OPTIONS.MultiPV;
   }
 
   // ★エンジンに同梱された評価関数を検出して「評価関数」欄へ自動入力する
@@ -269,13 +393,13 @@
     try {
       const result = await window.connector.checkEvalFiles(enginePath);
       if (!result.ok || result.files.length === 0) {
-        if (!quiet) addLog('⚠ 評価関数を自動検出できませんでした。「評価関数」の参照から指定できます');
+        if (!quiet) addLocalLog('⚠ 評価関数を自動検出できませんでした。「評価関数」の参照から指定できます');
         return false;
       }
       const engineDir = enginePath.split('/').slice(0, -1).join('/');
       const full = `${engineDir}/${result.files[0]}`;
       $('#cfg-eval').value = full;
-      if (!quiet) addLog(`評価関数を自動検出 (${result.type}): ${result.files[0]}（変更する場合は参照から）`);
+      if (!quiet) addLocalLog(`評価関数を自動検出 (${result.type}): ${result.files[0]}（変更する場合は参照から）`);
       return true;
     } catch {
       return false;
@@ -285,13 +409,22 @@
   function setupMainHandlers(cfg) {
     activeConfig = { ...cfg };
 
+    // ★編集中フラグ: 設定パネルの入力を触ったら立てる(populateでリセット)
+    for (const id of ['cfg-engine-name', 'cfg-hash', 'cfg-fvscale', 'cfg-apikey', 'cfg-engine-ondemand']) {
+      const el = $(`#${id}`);
+      el.addEventListener('input', () => { formDirty = true; });
+      el.addEventListener('change', () => { formDirty = true; });
+    }
+
     // ===== エンジン登録簿の操作 =====
     $('#cfg-engine-select').addEventListener('change', (ev) => {
       stashEngineFields(); // 直前まで編集していたエントリの内容を保持
       selectedUri = ev.target.value;
+      formDirty = true;
+      engineSelectTouched = true;
       renderEngineSelect(); // 改名を選択肢ラベルへ反映
       loadEngineFields();
-      addLog('エンジンを切り替えるには「設定を保存」を押してください');
+      addLocalLog('エンジンを切り替えるには「設定を保存」を押してください');
     });
 
     $('#cfg-engine-name').addEventListener('change', () => {
@@ -313,9 +446,11 @@
         createdAt: Date.now(),
       };
       selectedUri = uri;
+      formDirty = true;
+      engineSelectTouched = true;
       renderEngineSelect();
       loadEngineFields();
-      addLog('エンジンを追加登録しました。「設定を保存」で切り替わります');
+      addLocalLog('エンジンを追加登録しました。「設定を保存」で切り替わります');
     });
 
     $('#btn-engine-dup').addEventListener('click', () => {
@@ -325,24 +460,28 @@
       const uri = generateUri('engine');
       draftEngines[uri] = JSON.parse(JSON.stringify({ ...src, uri, name: `${src.name}のコピー`, createdAt: Date.now() }));
       selectedUri = uri;
+      formDirty = true;
+      engineSelectTouched = true;
       renderEngineSelect();
       loadEngineFields();
-      addLog('エンジンを複製しました。評価関数やオプションを変えて使い分けできます');
+      addLocalLog('エンジンを複製しました。評価関数やオプションを変えて使い分けできます');
     });
 
     $('#btn-engine-del').addEventListener('click', () => {
       const e = draftEngines[selectedUri];
       if (!e) return;
       if (Object.keys(draftEngines).length <= 1) {
-        addLog('⚠ 最後のエンジンは削除できません');
+        addLocalLog('⚠ 最後のエンジンは削除できません');
         return;
       }
       if (!confirm(`「${e.name}」を登録から削除しますか？（ファイル自体は削除されません）`)) return;
       delete draftEngines[selectedUri];
       selectedUri = Object.keys(draftEngines)[0] || '';
+      formDirty = true;
+      engineSelectTouched = true;
       renderEngineSelect();
       loadEngineFields();
-      addLog('登録を削除しました。「設定を保存」で確定します');
+      addLocalLog('登録を削除しました。「設定を保存」で確定します');
     });
 
     // Engine executable select (選択中エントリの実行ファイル変更)
@@ -356,7 +495,7 @@
         nameField.value = engineDisplayNameFromPath(filePath);
       }
       $('#cfg-engine').value = filePath;
-      $('#engine-name').textContent = nameField.value || engineDisplayNameFromPath(filePath);
+      formDirty = true;
       // エンジンに合わせて評価関数欄も自動更新(変更したい場合は参照から)
       const filled = await autofillEvalFromEngine(filePath);
       if (!filled) {
@@ -371,7 +510,8 @@
       const filePath = await window.connector.selectEvalFile();
       if (filePath) {
         $('#cfg-eval').value = filePath;
-        addLog('評価関数を選択しました。「設定を保存」でエンジンに反映されます');
+        formDirty = true;
+        addLocalLog('評価関数を選択しました。「設定を保存」でエンジンに反映されます');
       }
     });
 
@@ -379,8 +519,10 @@
     $('#cfg-book-select').addEventListener('change', (ev) => {
       if (!ev.target.value) return;
       selectedBookUri = ev.target.value;
+      formDirty = true;
+      bookSelectTouched = true;
       renderBookSelect();
-      addLog('定跡を切り替えるには「設定を保存」を押してください');
+      addLocalLog('定跡を切り替えるには「設定を保存」を押してください');
     });
 
     $('#btn-book-add').addEventListener('click', async () => {
@@ -389,8 +531,10 @@
       const uri = generateUri('book');
       draftBooks[uri] = { uri, name: bookDisplayNameFromPath(filePath), path: filePath, createdAt: Date.now() };
       selectedBookUri = uri;
+      formDirty = true;
+      bookSelectTouched = true;
       renderBookSelect();
-      addLog('定跡を追加登録しました。「設定を保存」で反映されます');
+      addLocalLog('定跡を追加登録しました。「設定を保存」で反映されます');
     });
 
     $('#btn-book-del').addEventListener('click', () => {
@@ -399,46 +543,64 @@
       if (!confirm(`「${b.name}」を登録から削除しますか？（ファイル自体は削除されません）`)) return;
       delete draftBooks[selectedBookUri];
       selectedBookUri = Object.keys(draftBooks)[0] || '';
+      formDirty = true;
+      bookSelectTouched = true;
       renderBookSelect();
-      addLog('定跡の登録を削除しました。「設定を保存」で確定します');
+      addLocalLog('定跡の登録を削除しました。「設定を保存」で確定します');
     });
 
     // Save
     $('#btn-save').addEventListener('click', async () => {
-      let threads = parseInt($('#cfg-threads').value, 10) || 4;
       let hash = parseInt($('#cfg-hash').value, 10) || 1024;
-      if (threads > maxThreads) { threads = maxThreads; $('#cfg-threads').value = threads; addLog(`Threadsを${maxThreads}に制限しました (CPUコア数上限)`); }
-      if (hash > maxHashMB) { hash = maxHashMB; $('#cfg-hash').value = hash; addLog(`Hashを${maxHashMB}MBに制限しました (メモリ75%上限)`); }
+      if (hash > maxHashMB) { hash = maxHashMB; $('#cfg-hash').value = hash; addLocalLog(`Hashを${maxHashMB}MBに制限しました (メモリ75%上限)`); }
       // APIキー: 欄に貼り付けがあれば置き換え、空なら現在のキーを維持
       const typedKey = $('#cfg-apikey').value.trim();
       if (typedKey && !/^sk_live_[0-9a-f]{48}$/.test(typedKey)) {
-        addLog('⚠ APIキーの形式が正しくありません（sk_live_ で始まる発行済みキーを貼り付けてください）');
+        addLocalLog('⚠ APIキーの形式が正しくありません（sk_live_ で始まる発行済みキーを貼り付けてください）');
         return;
       }
       stashEngineFields();
-      const selected = draftEngines[selectedUri];
+
+      // ★Web所有値の統合: フォーム編集中に研究室から変更された値を巻き戻さない。
+      //   Threads/MultiPV(エンジン別)と、PC側で触っていないエンジン/定跡選択は最新設定が正
+      const fresh = (await window.connector.getConfig()) || activeConfig || {};
+      for (const [uri, e] of Object.entries(draftEngines)) {
+        const freshOpts = fresh.engines?.[uri]?.options;
+        if (freshOpts) {
+          if (freshOpts.Threads !== undefined) e.options.Threads = freshOpts.Threads;
+          if (freshOpts.MultiPV !== undefined) e.options.MultiPV = freshOpts.MultiPV;
+        }
+      }
+      const effEngineUri = engineSelectTouched
+        ? selectedUri
+        : (fresh.defaultEngineUri && draftEngines[fresh.defaultEngineUri] ? fresh.defaultEngineUri : selectedUri);
+      const effBookUri = bookSelectTouched
+        ? selectedBookUri
+        : (fresh.defaultBookUri && draftBooks[fresh.defaultBookUri] ? fresh.defaultBookUri : selectedBookUri);
+
+      const selected = draftEngines[effEngineUri];
       const updated = {
-        serverUrl: activeConfig?.serverUrl || DEFAULT_SERVER_URL,
-        apiKey: typedKey || activeConfig?.apiKey || '',
+        serverUrl: activeConfig?.serverUrl || fresh.serverUrl || DEFAULT_SERVER_URL,
+        apiKey: typedKey || fresh.apiKey || activeConfig?.apiKey || '',
         // 登録簿(v2)。フラット項目は使用中エンジンのミラー(旧バージョン互換+main側の差分検出用)
         engines: draftEngines,
-        defaultEngineUri: selectedUri,
+        defaultEngineUri: effEngineUri,
         enginePath: selected?.path || '',
         evalPath: selected?.evalPath || '',
         engineOptions: { ...(selected?.options || {}) },
         books: draftBooks,
-        defaultBookUri: selectedBookUri,
-        bookPath: draftBooks[selectedBookUri]?.path || '',
-        useBook: activeConfig?.useBook === true,
+        defaultBookUri: effBookUri,
+        bookPath: draftBooks[effBookUri]?.path || '',
+        useBook: fresh.useBook === true, // 定跡の利用ON/OFFは研究室のセレクタが正(PCにトグルは無い)
         engineMode: $('#cfg-engine-ondemand').checked ? ENGINE_MODE_ON_DEMAND : ENGINE_MODE_ALWAYS,
       };
       const result = await window.connector.saveConfig(updated);
       if (result?.ok) {
         // 正規化済み(表示名の一意化・登録簿の採番済み)の設定を読み直してドラフトを同期
-        const fresh = await window.connector.getConfig();
-        activeConfig = fresh || updated;
-        if (fresh) populateSettings(fresh);
-        addLog(result.restartedSocket
+        const freshAfter = await window.connector.getConfig();
+        activeConfig = freshAfter || updated;
+        if (freshAfter) populateSettings(freshAfter);
+        addLocalLog(result.restartedSocket
           ? '設定を保存し、接続を更新しました'
           : result.restartedEngine
             ? '設定を保存し、エンジンを再起動しました'
@@ -446,12 +608,12 @@
               ? '設定を保存しました（次回解析時に反映）'
               : '設定を保存しました');
       } else {
-        addLog('⚠ 設定を保存できませんでした');
+        addLocalLog('⚠ 設定を保存できませんでした');
       }
     });
 
-    // Reconnect
-    $('#btn-reconnect').addEventListener('click', async () => {
+    // Reconnect（設定パネルと状態パネルの両方から）
+    const reconnect = async () => {
       await window.connector.disconnect();
       const freshConfig = await window.connector.getConfig();
       if (freshConfig) {
@@ -459,84 +621,137 @@
         populateSettings(freshConfig);
         window.connector.connect(freshConfig);
       }
-    });
+    };
+    $('#btn-reconnect').addEventListener('click', reconnect);
+    $('#btn-reconnect-hero').addEventListener('click', reconnect);
   }
 
-  // ========== Status & Logs ==========
+  // ========== Status & Config Sync ==========
   window.connector.onStatusUpdate((status) => {
-    const badge = $('#status-badge');
-    const text = $('#status-text');
-    const engineStatus = $('#engine-status');
+    renderStatus(status);
+  });
 
-    if (status.connected) {
-      badge.className = 'status-badge online';
-      text.textContent = 'ONLINE';
+  // ★Webからの切替(エンジン/定跡/オプション)をフォームへ反映。
+  //   編集中(formDirty)はドラフトを潰さず、状態パネルだけ更新(保存時にWeb所有値を統合する)
+  window.connector.onConfigUpdated((cfg) => {
+    if (!cfg) return;
+    activeConfig = cfg;
+    if (formDirty) {
+      updateHero(cfg);
     } else {
-      badge.className = 'status-badge offline';
-      text.textContent = 'OFFLINE';
+      populateSettings(cfg);
     }
-
-    const isOnDemandIdle = status.connected && !status.engineRunning && status.engineMode === ENGINE_MODE_ON_DEMAND;
-    engineStatus.textContent = status.engineRunning ? '待機中' : (isOnDemandIdle ? '省メモリ待機' : '停止');
-
-    // ステータスバー更新
-    const sbConn = $('#sb-connection');
-    const sbEngine = $('#sb-engine');
-    if (sbConn) sbConn.textContent = `接続: ${status.connected ? 'オンライン' : 'オフライン'}`;
-    if (sbEngine) sbEngine.textContent = `エンジン: ${status.engineRunning ? '待機中' : (isOnDemandIdle ? '省メモリ待機' : '停止')}`;
   });
 
-  window.connector.onLogMessage((msg) => {
-    addLog(msg);
-  });
+  // ========== ログ（層別: 診断ログは「詳細ログ」トグルで表示） ==========
+  const LOG_LIMIT = 300;
+  const logEntries = []; // { time, text, kind }
+  let verboseLog = false;
 
-  function addLog(msg) {
-    const container = $('#log-container');
-    const entry = document.createElement('div');
-    entry.className = 'log-entry';
-    entry.textContent = msg;
-    container.appendChild(entry);
-    container.scrollTop = container.scrollHeight;
-
-    // 最大100件
-    while (container.children.length > 100) {
-      container.removeChild(container.firstChild);
-    }
+  function classifyLog(text) {
+    if (text.startsWith('[DIAG]')) return 'diag';
+    if (/[⚠❌]|エラー|失敗|できません|見つかりません/.test(text)) return 'warn';
+    if (/解析|バッチ|定跡/.test(text)) return 'ana';
+    if (/エンジン|評価関数|オプション|準備完了|MultiPV|Threads|Hash/.test(text)) return 'eng';
+    if (/接続|切断|Linea Cloud|オンライン|トレイ|アップデート|ダウンロード/.test(text)) return 'conn';
+    return 'info';
   }
+
+  const KIND_CLASS = { conn: 'c-conn', eng: 'c-eng', ana: 'c-ana', warn: 'c-warn', diag: '', info: '' };
+
+  function renderLog() {
+    const container = $('#log-container');
+    const frag = document.createDocumentFragment();
+    let diagCount = 0;
+    for (const e of logEntries) {
+      if (e.kind === 'diag') {
+        diagCount++;
+        if (!verboseLog) continue;
+      }
+      const row = document.createElement('div');
+      row.className = `fe${e.kind === 'diag' ? ' diag' : ''}`;
+      const t = document.createElement('span');
+      t.className = 't';
+      t.textContent = e.time;
+      const d = document.createElement('span');
+      d.className = `d ${KIND_CLASS[e.kind] || ''}`.trim();
+      const m = document.createElement('span');
+      m.className = 'm';
+      m.textContent = e.text;
+      row.append(t, d, m);
+      frag.appendChild(row);
+    }
+    if (!verboseLog && diagCount > 0) {
+      const row = document.createElement('div');
+      row.className = 'fe coalesced';
+      const t = document.createElement('span');
+      t.className = 't';
+      t.textContent = '…';
+      const d = document.createElement('span');
+      d.className = 'd';
+      const m = document.createElement('span');
+      m.className = 'm';
+      m.textContent = `診断ログ ${diagCount} 件（詳細ログで表示）`;
+      row.append(t, d, m);
+      frag.appendChild(row);
+    }
+    container.replaceChildren(frag);
+    container.scrollTop = container.scrollHeight;
+  }
+
+  // main からのログ行: "HH:MM:SS  メッセージ"
+  window.connector.onLogMessage((entry) => {
+    const match = String(entry).match(/^(\S+)\s+([\s\S]*)$/);
+    const time = match ? match[1] : '';
+    const text = match ? match[2] : String(entry);
+    pushLog(time, text);
+  });
+
+  function pushLog(time, text) {
+    logEntries.push({ time, text, kind: classifyLog(text) });
+    while (logEntries.length > LOG_LIMIT) logEntries.shift();
+    renderLog();
+  }
+
+  // renderer 自身の操作ガイダンス(mainを経由しないログ)
+  function addLocalLog(text) {
+    const time = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+    pushLog(time, text);
+  }
+
+  $('#btn-verbose-log').addEventListener('click', () => {
+    verboseLog = !verboseLog;
+    $('#btn-verbose-log').setAttribute('aria-pressed', String(verboseLog));
+    renderLog();
+  });
 
   // ★USI通信ログコピー（エンジンとの生のやりとり直近100件）
   $('#btn-copy-usi').addEventListener('click', async () => {
     const btn = $('#btn-copy-usi');
     const text = await window.connector.getUsiHistory();
     if (!text) {
-      addLog('USI通信ログはまだありません（エンジン起動後に記録されます）');
+      addLocalLog('USI通信ログはまだありません（エンジン起動後に記録されます）');
       return;
     }
     try {
       await navigator.clipboard.writeText(text);
       btn.textContent = '✅ コピー済み';
-      setTimeout(() => { btn.textContent = '⚙ USI通信'; }, 2000);
+      setTimeout(() => { btn.textContent = 'USI通信'; }, 2000);
     } catch {
-      addLog('USI通信ログのコピーに失敗しました');
+      addLocalLog('USI通信ログのコピーに失敗しました');
     }
   });
 
-  // ★ログコピー機能
+  // ★ログコピー（診断ログ含む全件 — サポート用）
   $('#btn-copy-log').addEventListener('click', async () => {
-    const container = $('#log-container');
-    const lines = Array.from(container.children).map(el => el.textContent);
-    const text = lines.join('\n');
+    const text = logEntries.map((e) => `${e.time}  ${e.text}`).join('\n');
     try {
       await navigator.clipboard.writeText(text);
       const btn = $('#btn-copy-log');
       btn.textContent = '✅ コピー済み';
-      setTimeout(() => { btn.textContent = '📋 コピー'; }, 2000);
+      setTimeout(() => { btn.textContent = 'コピー'; }, 2000);
     } catch {
-      // フォールバック: 手動選択
-      const range = document.createRange();
-      range.selectNodeContents(container);
-      window.getSelection().removeAllRanges();
-      window.getSelection().addRange(range);
+      addLocalLog('ログのコピーに失敗しました');
     }
   });
 

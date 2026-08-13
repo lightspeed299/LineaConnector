@@ -1,5 +1,5 @@
 // Linea Connector — Electron Main Process
-const { app, BrowserWindow, ipcMain, dialog, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, safeStorage, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -58,10 +58,23 @@ function isOnDemandEngineMode(config = currentConfig) {
 }
 
 function buildStatus(connected = !!socket?.connected, engineRunning = !!(engine && engine.running)) {
+  const opts = currentConfig?.engineOptions || {};
   return {
     connected,
     engineRunning,
     engineMode: getEngineMode(currentConfig),
+    // ★状態パネル用(v6.7.0〜): 解析中/バッチ進捗/直近のNPS・深さ・評価値
+    analyzing: isAnalyzing,
+    batch: batchActive && batchJobTotal > 0
+      ? { done: batchJobDone, total: batchJobTotal, secondsPerMove: batchSecondsPerMove }
+      : null,
+    live: liveInfo,
+    // 現在の主要オプション(欄を廃止した Threads/MultiPV の読み取り専用表示用)
+    options: {
+      Threads: opts.Threads,
+      MultiPV: opts.MultiPV,
+      hashMB: opts.USI_Hash,
+    },
   };
 }
 
@@ -175,6 +188,42 @@ function sendStatus(status) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('status-update', status);
   }
+  updateTrayTooltip(status);
+}
+
+// ★設定同期(v6.7.0〜): Webからの切替(EngineUri/BookUri/UseBook/オプション)を
+//   renderer のフォームへ即時反映する。古いドラフトでの「設定を保存」による巻き戻り防止
+function sendConfigUpdated() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('config-updated', loadConfig());
+  }
+}
+
+// ★対話解析のライブ情報(multipv 1 のみ・1秒スロットリングで renderer へ)
+const LIVE_STATUS_PUSH_MS = 1000;
+let liveInfo = null; // { nps, depth, seldepth, scoreCP, scoreMate, turn } | null
+let lastLiveStatusPushAt = 0;
+
+function noteLiveInfo(parsed) {
+  const prev = liveInfo || {};
+  const hasScore = parsed.scoreCP !== undefined || parsed.scoreMate !== undefined;
+  liveInfo = {
+    nps: parsed.nps !== undefined ? parsed.nps : prev.nps,
+    depth: parsed.depth !== undefined ? parsed.depth : prev.depth,
+    seldepth: parsed.seldepth !== undefined ? parsed.seldepth : prev.seldepth,
+    scoreCP: hasScore ? parsed.scoreCP : prev.scoreCP,
+    scoreMate: hasScore ? parsed.scoreMate : prev.scoreMate,
+    turn: lastTurn,
+  };
+  const now = Date.now();
+  if (now - lastLiveStatusPushAt >= LIVE_STATUS_PUSH_MS) {
+    lastLiveStatusPushAt = now;
+    sendStatus(buildStatus());
+  }
+}
+
+function clearLiveInfo() {
+  liveInfo = null;
 }
 
 // --- Socket.io + Engine ---
@@ -200,6 +249,29 @@ let batchJobDone = 0;
 let batchJobTotal = 0;
 // analyze_stop で止められたジョブ。preempted 再キュー時の復活を防ぐ。
 const stoppedBatchJobs = new Set();
+
+// ★バッチ全解析中は MultiPV=1 を強制(v6.7.0〜)。バッチ結果は multipv1 しか使わないため、
+//   設定 MultiPV のまま探索すると同じ movetime で深さを損する。対話解析が割り込んだら
+//   設定値へ戻し、バッチ再開時にまた 1 へ。エンジンに実際に適用されている値をここで追跡する
+//   (エンジン起動時は config 値が適用される)。
+let engineAppliedMultiPV = null;
+
+async function ensureEngineMultiPV(target) {
+  const t = Number(target);
+  if (!engine || !engine.running || !Number.isFinite(t) || t < 1) return;
+  if (engineAppliedMultiPV === t) return;
+  try {
+    log(`[DIAG] MultiPV を ${t} へ切替 (バッチ/対話の使い分け)`);
+    await engine.setOptions({ MultiPV: t });
+    engineAppliedMultiPV = t;
+  } catch (e) {
+    log(`MultiPV切替エラー: ${e.message}`);
+  }
+}
+
+function configuredMultiPV() {
+  return Number(currentConfig?.engineOptions?.MultiPV) || 1;
+}
 
 function markActivity() {
   lastActivityAt = Date.now();
@@ -346,6 +418,8 @@ function emitEngineSettings() {
       //   エンジン/定跡セレクタを出すのに使う(無ければ旧Connectorとして非表示)
       activeEngineUri: currentConfig.defaultEngineUri || null,
       activeBookUri: currentConfig.defaultBookUri || null,
+      // ★このPCの論理コア数(v6.7.0〜)。研究室のThreads選択肢の上限クランプ用(サーバー素通し)
+      cpuCores: os.cpus().length,
       catalog: {
         engines: catalogEntries(currentConfig.engines),
         books: catalogEntries(currentConfig.books),
@@ -566,7 +640,9 @@ function connectToServer(config) {
             // 対話解析セッションとしては扱わない(エンジンは止め、バッチには道を譲る)
             if (isAnalyzing) {
               isAnalyzing = false;
+              clearLiveInfo();
               if (engine) engine.stop();
+              sendStatus(buildStatus());
             }
             // 定跡の連鎖でPVを延長(上位10候補のみ・最大10手)
             const extended = await b.extendPvMoves(sfen, bookMoves.slice(0, 10));
@@ -594,6 +670,11 @@ function connectToServer(config) {
     }
     isAnalyzing = true;
     log('解析開始...');
+    clearLiveInfo();
+    sendStatus(buildStatus());
+    // バッチが MultiPV=1 に切り替えていた場合は設定値へ戻す(通常は no-op)
+    await ensureEngineMultiPV(configuredMultiPV());
+    if (lastSfen !== requestSfen || lastTurn !== requestTurn) return;
     // UsiEngine 内部で「予約+暗黙stop→bestmove後にposition/go」に直列化される。
     // バッチのmovetime探索中なら結果は破棄され、ループが再キューする。
     engine.analyze(sfen);
@@ -603,10 +684,12 @@ function connectToServer(config) {
     markActivity();
     log('解析停止');
     isAnalyzing = false;
+    clearLiveInfo();
     if (engine) {
       // discardSearch: バッチ探索が走っていた場合は結果を捨てさせる（ループが再キュー）
       engine.stop({ discardSearch: true });
     }
+    sendStatus(buildStatus());
     scheduleEngineIdleShutdown();
   });
 
@@ -638,6 +721,7 @@ function connectToServer(config) {
       if (Number.isFinite(total) && total > 0) batchJobTotal = total;
     }
     startBatchLoop();
+    sendStatus(buildStatus());
   });
 
   socket.on('connector:analyze_stop', (data) => {
@@ -713,6 +797,7 @@ function connectToServer(config) {
       try { saveConfig(nextCfg); } catch (e) { log(`設定保存エラー: ${e.message}`); }
       log(`エンジンを切り替えます: ${entry.name}`);
       await applyConfigUpdate(nextCfg, prevCfg);
+      sendConfigUpdated();
       return;
     }
 
@@ -736,6 +821,7 @@ function connectToServer(config) {
       try { saveConfig(nextCfg); } catch (e) { log(`設定保存エラー: ${e.message}`); }
       log(`定跡を切り替えます: ${entry.name}`);
       await applyConfigUpdate(nextCfg, prevCfg);
+      sendConfigUpdated();
       return;
     }
 
@@ -749,6 +835,7 @@ function connectToServer(config) {
       try { saveConfig(cfg); } catch (e) { log(`設定保存エラー: ${e.message}`); }
       log(`定跡利用を${useBook ? '有効' : '無効'}にしました`);
       emitEngineSettings();
+      sendConfigUpdated();
       // 読み込み完了後にもう一度同期(loading→ok/errorの反映)
       if (useBook && cfg.bookPath) {
         void ensureBook(cfg).then(() => emitEngineSettings());
@@ -768,6 +855,8 @@ function connectToServer(config) {
     if (!engine || !engine.running) {
       log('[DIAG] エンジン停止中のため、次回起動時にオプションを反映します');
       emitEngineSettings();
+      sendConfigUpdated();
+      sendStatus(buildStatus());
       return;
     }
 
@@ -776,14 +865,17 @@ function connectToServer(config) {
       // 探索中なら UsiEngine が stop→bestmove→setoption→isready を直列化する。
       // バッチ探索は破棄され再キューされる。
       await engine.setOptions({ [name]: value });
+      if (name === 'MultiPV') engineAppliedMultiPV = Number(value) || engineAppliedMultiPV;
       if (wasAnalyzing && lastSfen) {
         engine.analyze(lastSfen);
       }
     } catch (e) {
       log(`オプション変更エラー: ${e.message}`);
     } finally {
-      // ★設定同期: 変更後の実際の値をブラウザへ通知
+      // ★設定同期: 変更後の実際の値をブラウザへ通知 + rendererのフォームへも反映
       emitEngineSettings();
+      sendConfigUpdated();
+      sendStatus(buildStatus());
     }
   });
 
@@ -795,6 +887,8 @@ function disconnectFromServer() {
   void closeBook();
   const e = engine;
   engine = null;
+  clearLiveInfo();
+  engineAppliedMultiPV = null;
   if (e) e.quit();
   if (socket) {
     socket.disconnect();
@@ -811,6 +905,8 @@ function disconnectFromServer() {
 function stopEngineProcess() {
   const e = engine;
   engine = null;
+  clearLiveInfo();
+  engineAppliedMultiPV = null;
   if (!e) return Promise.resolve();
   clearEngineIdleShutdown();
   return e.quit();
@@ -852,8 +948,11 @@ async function startEngine(config) {
     //     multipv/scoreCP/scoreMate/lowerbound/upperbound/pv[]）。
     //     info(生文字列)は旧クライアント互換のため残す。サーバーは素通しする。
     e.onInfo = ({ sfen, raw, parsed }) => {
-      if (!isAnalyzing || !socket?.connected) return;
+      if (!isAnalyzing) return;
       if (sfen !== lastSfen) return;
+      // ★状態パネルのライブ表示(multipv1のみ・スコア無しの nps 行も拾う)
+      if (parsed.multipv === undefined || parsed.multipv === 1) noteLiveInfo(parsed);
+      if (!socket?.connected) return;
       if (parsed.scoreCP === undefined && parsed.scoreMate === undefined) return;
       const multipv = parsed.multipv === undefined ? 1 : parsed.multipv;
       queueAnalysisUpdate(multipv, { info: raw, sfen: lastSfen, turn: lastTurn, v2: parsed });
@@ -865,6 +964,8 @@ async function startEngine(config) {
       log(`エンジン終了 (code: ${code}${signal ? `, signal: ${signal}` : ''}${reason ? `, ${reason}` : ''})`);
       const wasAnalyzing = isAnalyzing;
       isAnalyzing = false;
+      clearLiveInfo();
+      engineAppliedMultiPV = null;
       sendStatus(buildStatus(!!socket?.connected, false));
 
       // ★エンジン自動再起動（意図しないクラッシュ・応答不能時）
@@ -892,6 +993,9 @@ async function startEngine(config) {
     try {
       const res = await e.launch();
       if (engine !== e) return false; // 起動待ちの間に破棄された
+      // 起動時は config の値がそのまま適用される(バッチのMultiPV=1切替の基準点)
+      engineAppliedMultiPV = Number(normalizedConfig.engineOptions?.MultiPV) || null;
+      clearLiveInfo();
       log(`エンジン準備完了: ${res.id.name || path.basename(enginePath)}`);
       // 登録簿の使用中エントリへ USI id name/author を記録する(表示・将来のカタログ同期用)
       try {
@@ -966,6 +1070,15 @@ function startBatchLoop() {
       const item = batchQueue.shift();
       if (!item) break;
 
+      // ★バッチは multipv1 の結果しか使わないので MultiPV=1 で探索する(深さ優先)。
+      //   対話解析が割り込むと request_analysis 側で設定値へ戻る
+      await ensureEngineMultiPV(1);
+      if (isAnalyzing || !engine || !engine.running) {
+        // setoption 待ちの間に割り込み/エンジン停止 → 再キューしてループ先頭の処理に任せる
+        batchQueue.unshift(item);
+        continue;
+      }
+
       const res = await engine.search(item.sfen, batchSecondsPerMove * 1000);
       if (res.status === 'done') {
         if (socket?.connected) {
@@ -980,6 +1093,7 @@ function startBatchLoop() {
           }
           socket.emit('connector:analysis_result', payload);
           batchJobDone += 1;
+          sendStatus(buildStatus());
           // 10 局面ごと・ジョブ完走時にジョブ全体の進捗を出す
           if (batchJobDone % 10 === 0 || batchJobDone === batchJobTotal) {
             log(`バッチ解析: ${batchJobDone}/${batchJobTotal || '?'} 局面完了`);
@@ -994,11 +1108,16 @@ function startBatchLoop() {
       }
     }
     batchActive = false;
+    // バッチが MultiPV=1 に切り替えていた場合は設定値へ復元
+    await ensureEngineMultiPV(configuredMultiPV());
+    sendStatus(buildStatus());
     scheduleEngineIdleShutdown();
   })().catch((err) => {
     log(`バッチ解析ループエラー: ${err?.message || err}`);
     batchActive = false;
     batchQueue = [];
+    void ensureEngineMultiPV(configuredMultiPV());
+    sendStatus(buildStatus());
     scheduleEngineIdleShutdown();
   });
 }
@@ -1144,9 +1263,9 @@ function setupIPC() {
 // --- ウィンドウ作成 ---
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 520,
-    height: 680,
-    minWidth: 420,
+    width: 560,
+    height: 720,
+    minWidth: 440,
     minHeight: 520,
     resizable: true,
     show: !process.env.LINEA_CONNECTOR_HIDDEN,
@@ -1161,6 +1280,76 @@ function createWindow() {
   });
 
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+
+  // ★トレイ常駐(v6.7.0〜): ✕はアプリ終了ではなくトレイへ。
+  //   誤って閉じても接続・全解析が生き続ける(常駐アプリの標準作法)
+  mainWindow.on('close', (e) => {
+    if (isQuitting) return;
+    e.preventDefault();
+    mainWindow.hide();
+    if (!trayNoticeShown && tray) {
+      trayNoticeShown = true;
+      try {
+        tray.displayBalloon({
+          iconType: 'info',
+          title: 'Linea Connector はトレイで動作中',
+          content: '接続と解析はバックグラウンドで続きます。終了するにはトレイアイコンを右クリック →「終了」。',
+        });
+      } catch (_) { /* balloon非対応環境は無視 */ }
+    }
+  });
+}
+
+// --- トレイ常駐 ---
+let tray = null;
+let isQuitting = false;
+let trayNoticeShown = false;
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.show();
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.focus();
+}
+
+function createTray() {
+  if (tray) return;
+  try {
+    const image = nativeImage.createFromPath(path.join(__dirname, 'assets', 'icon.ico'));
+    tray = new Tray(image);
+    tray.setToolTip('Linea Connector');
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: '開く', click: () => showMainWindow() },
+      {
+        label: '再接続',
+        click: () => {
+          const cfg = currentConfig || loadConfig();
+          if (cfg?.apiKey && cfg?.enginePath) {
+            disconnectFromServer();
+            connectToServer(cfg);
+          }
+        },
+      },
+      { type: 'separator' },
+      { label: '終了', click: () => { isQuitting = true; app.quit(); } },
+    ]));
+    tray.on('double-click', () => showMainWindow());
+  } catch (e) {
+    // トレイが作れない環境でもアプリ自体は動かす(その場合✕で終了)
+    tray = null;
+    log(`トレイ初期化に失敗しました: ${e.message}`);
+  }
+}
+
+function updateTrayTooltip(status) {
+  if (!tray) return;
+  const conn = status?.connected ? 'オンライン' : 'オフライン';
+  const engineState = status?.analyzing
+    ? '解析中'
+    : status?.batch
+      ? `全解析 ${status.batch.done}/${status.batch.total}`
+      : status?.engineRunning ? '待機中' : '停止';
+  try { tray.setToolTip(`Linea Connector — ${conn} · ${engineState}`); } catch (_) { /* ignore */ }
 }
 
 // --- アプリ起動 ---
@@ -1169,6 +1358,7 @@ app.whenReady().then(() => {
   migrateOldConfig();
   setupIPC();
   createWindow();
+  createTray();
   setupAutoUpdater();
 });
 
@@ -1179,6 +1369,8 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  // autoUpdater.quitAndInstall やトレイの「終了」経由でも close ガードを通過させる
+  isQuitting = true;
   stopUpdateCheckSchedule();
 });
 
