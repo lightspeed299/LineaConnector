@@ -58,7 +58,6 @@ function isOnDemandEngineMode(config = currentConfig) {
 }
 
 function buildStatus(connected = !!socket?.connected, engineRunning = !!(engine && engine.running)) {
-  const opts = currentConfig?.engineOptions || {};
   return {
     connected,
     engineRunning,
@@ -69,12 +68,6 @@ function buildStatus(connected = !!socket?.connected, engineRunning = !!(engine 
       ? { done: batchJobDone, total: batchJobTotal, secondsPerMove: batchSecondsPerMove }
       : null,
     live: liveInfo,
-    // 現在の主要オプション(欄を廃止した Threads/MultiPV の読み取り専用表示用)
-    options: {
-      Threads: opts.Threads,
-      MultiPV: opts.MultiPV,
-      hashMB: opts.USI_Hash,
-    },
   };
 }
 

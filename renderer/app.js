@@ -145,10 +145,6 @@
     return String(p || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || '定跡';
   }
 
-  function fileBaseName(p) {
-    return String(p || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || '';
-  }
-
   // パス末尾の depth+1 セグメントをラベル化（config-schema.js の uniquifyBookNames と同ロジック。
   // user_book1.db 衝突時だけ親フォルダを足して区別する — 保存前のドラフト表示用）
   function bookLabelFromPath(p, depth) {
@@ -201,22 +197,14 @@
     updateHero(cfg);
   }
 
-  // ===== 状態パネル =====
+  // ===== 状態ストリップ =====
 
-  // 使用中エンジンの見出しとサブ行(id name · 評価関数 · 定跡)を activeConfig から描く
+  // 使用中エンジンの表示名だけを出す(USI id name等の詳細は出さない — 本人指定 2026-08-14)
   function updateHero(cfg) {
     const c = cfg || activeConfig;
     if (!c) return;
     const entry = c.engines?.[c.defaultEngineUri];
-    const name = entry?.name || engineDisplayNameFromPath(c.enginePath) || '—';
-    $('#st-engine-name').textContent = name;
-    const parts = [];
-    if (entry?.defaultName && entry.defaultName !== name) parts.push(entry.defaultName);
-    const evalName = fileBaseName(c.evalPath || entry?.evalPath);
-    if (evalName) parts.push(evalName);
-    const activeBook = c.books?.[c.defaultBookUri];
-    if (c.useBook && activeBook?.name) parts.push(`定跡 ${activeBook.name}`);
-    $('#st-engine-sub').textContent = parts.join(' · ');
+    $('#st-engine-name').textContent = entry?.name || engineDisplayNameFromPath(c.enginePath) || '—';
   }
 
   function fmtNps(nps) {
@@ -266,12 +254,13 @@
     conn.className = `conn ${connected ? 'on' : 'off'}`;
     $('#conn-text').textContent = connected ? 'オンライン' : 'オフライン';
 
+    // 待機中は1行のみ。何か起きているときだけ下段(ライブ統計/進捗/再接続)が出現する
     const showLive = connected && status.analyzing;
     const showBatch = connected && !status.analyzing && !!status.batch;
-    const showIdle = connected && !showLive && !showBatch;
+    const showExtra = showLive || showBatch || !connected;
+    $('#status-extra').classList.toggle('hidden', !showExtra);
     $('#strip-live').classList.toggle('hidden', !showLive);
     $('#strip-batch').classList.toggle('hidden', !showBatch);
-    $('#strip-idle').classList.toggle('hidden', !showIdle);
     $('#strip-offline').classList.toggle('hidden', connected);
 
     if (!connected) {
@@ -302,13 +291,6 @@
     // 待機系
     const isOnDemandIdle = !status.engineRunning && status.engineMode === ENGINE_MODE_ON_DEMAND;
     setChip(status.engineRunning ? '待機中' : (isOnDemandIdle ? '省メモリ待機' : '停止'), '');
-    const o = status.options || {};
-    const bits = [];
-    if (o.Threads !== undefined) bits.push(`Threads <b>${o.Threads}</b>`);
-    if (o.MultiPV !== undefined) bits.push(`MultiPV <b>${o.MultiPV}</b>`);
-    if (o.hashMB !== undefined) bits.push(`Hash <b>${o.hashMB} MB</b>`);
-    const suffix = status.engineRunning ? ' — リクエスト待ち' : '';
-    $('#strip-idle').innerHTML = bits.length > 0 ? `${bits.join(' · ')}${suffix}` : (suffix || '&nbsp;');
   }
 
   // ===== 設定フォーム =====

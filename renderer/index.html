@@ -69,16 +69,15 @@
     </div>
 
     <div class="content-area">
-      <!-- 状態: 接続とエンジンの状態はここ1か所 -->
-      <section class="panel" id="status-panel" aria-label="接続とエンジンの状態">
+      <!-- 状態: 接続とエンジンの状態はここ1か所。待機中は1行だけ、
+           解析中/全解析/切断のときだけ下に情報が出現する -->
+      <section class="panel status-strip" id="status-panel" aria-label="接続とエンジンの状態">
         <div class="hero-top">
           <span id="conn-indicator" class="conn off"><span class="dot"></span><span id="conn-text">オフライン</span></span>
+          <span id="st-engine-name" class="strip-engine">—</span>
           <span id="state-chip" class="chip"><span class="cdot"></span><span id="state-chip-text">停止</span></span>
         </div>
-        <div id="st-engine-name" class="engine-title">—</div>
-        <div id="st-engine-sub" class="engine-sub"></div>
-
-        <div class="strip">
+        <div id="status-extra" class="status-extra hidden">
           <!-- 解析中: ライブ統計 -->
           <div id="strip-live" class="stats hidden">
             <div class="stat"><div class="k">NPS</div><div class="v" id="live-nps">—</div></div>
@@ -90,8 +89,6 @@
             <div class="prog"><i id="batch-fill" style="width:0%"></i></div>
             <span class="prog-txt" id="batch-text"></span>
           </div>
-          <!-- 待機中: 現在の主要設定(読み取り専用) -->
-          <div id="strip-idle" class="quiet-line hidden"></div>
           <!-- オフライン -->
           <div id="strip-offline" class="off-strip hidden">
             <span id="offline-text">サーバーに接続していません</span>
@@ -168,7 +165,6 @@
         </div>
 
         <div class="actions">
-          <span class="footnote">Threads・MultiPV は研究室（ブラウザ）の詳細パネルから変更します（このエンジンに保存されます）</span>
           <button id="btn-reconnect" class="w-btn">再接続</button>
           <button id="btn-save" class="w-btn primary">設定を保存</button>
         </div>
