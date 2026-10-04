@@ -6,6 +6,7 @@ const os = require('os');
 const io = require('socket.io-client');
 const { autoUpdater } = require('electron-updater');
 const { UsiEngine } = require('./usi-engine');
+const { MatchSession } = require('./match-session');
 const { openBook } = require('./book');
 
 const CURRENT_VERSION = `v${require('./package.json').version}`;
@@ -43,6 +44,9 @@ function sanitizeDeviceMeta(value, fallback, maxLength) {
 
 function getConnectorIdentity() {
   return {
+    deviceId: currentConfig?.deviceId,
+    capabilities: { connectorMatchV1: true },
+    protocolVersion: 1,
     deviceName: sanitizeDeviceMeta(os.hostname(), 'Windows PC', 64),
     platform: sanitizeDeviceMeta(`${os.type()} ${os.arch()}`, 'Windows', 32),
     version: CURRENT_VERSION,
@@ -64,6 +68,7 @@ function buildStatus(connected = !!socket?.connected, engineRunning = !!(engine 
     engineMode: getEngineMode(currentConfig),
     // ★状態パネル用(v6.7.0〜): 解析中/バッチ進捗/直近のNPS・深さ・評価値
     analyzing: isAnalyzing,
+    matchActive: matchSession.busy,
     batch: batchActive && batchJobTotal > 0
       ? { done: batchJobDone, total: batchJobTotal, secondsPerMove: batchSecondsPerMove }
       : null,
@@ -235,6 +240,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let batchQueue = []; // { jobId, sfen }[]
 let batchSecondsPerMove = 3;
 let batchActive = false;
+let batchLoopPromise = Promise.resolve();
 // ジョブ全体の進捗（サーバーが analyze_batch に載せてくる doneCount/totalCount が正）。
 // jobId が変わったらリセットする。
 let batchJobId = null;
@@ -242,6 +248,44 @@ let batchJobDone = 0;
 let batchJobTotal = 0;
 // analyze_stop で止められたジョブ。preempted 再キュー時の復活を防ぐ。
 const stoppedBatchJobs = new Set();
+
+const matchSession = new MatchSession({
+  engine: () => engine,
+  deviceId: () => currentConfig?.deviceId,
+  emit: (event, data) => { if (socket?.connected) socket.emit(event, data); },
+  status: () => sendStatus(buildStatus()),
+  drain: async () => {
+    isAnalyzing = false;
+    lastSfen = null;
+    lastTurn = null;
+    batchQueue = [];
+    clearEngineIdleShutdown();
+    clearLiveInfo();
+    pendingInfoByMultipv.clear();
+    if (engineStartPromise) await engineStartPromise;
+    engine?.stop({ discardSearch: true });
+    await batchLoopPromise;
+    await engine?.stopAndWait();
+  },
+  prepare: async (uri) => {
+    const entry = currentConfig?.engines?.[uri];
+    if (!entry) throw new Error('登録したエンジンが見つかりません');
+    const matchConfig = normalizeConfig({ ...currentConfig, defaultEngineUri: uri,
+      enginePath: entry.path, evalPath: entry.evalPath, engineOptions: { ...entry.options } });
+    if (engineStartPromise) await engineStartPromise;
+    if (!await startEngine(matchConfig)) throw new Error('エンジンを起動できませんでした');
+    return engine;
+  },
+  // The temporary engine is discarded, so no match option can leak into the
+  // next analysis. The saved configuration is untouched and lazily relaunched.
+  restore: async () => { await stopEngineProcess(); },
+});
+
+function rejectWhileMatching(ack) {
+  if (!matchSession.busy) return false;
+  if (typeof ack === 'function') ack({ ok: false, error: 'Connector対局中です' });
+  return true;
+}
 
 // ★バッチ全解析中は MultiPV=1 を強制(v6.7.0〜)。バッチ結果は multipv1 しか使わないため、
 //   設定 MultiPV のまま探索すると同じ movetime で深さを損する。対話解析が割り込んだら
@@ -382,7 +426,7 @@ function queueAnalysisUpdate(multipv, payload) {
   if (infoFlushTimer) return;
   infoFlushTimer = setTimeout(() => {
     infoFlushTimer = null;
-    if (!socket?.connected) { pendingInfoByMultipv.clear(); return; }
+    if (!socket?.connected || matchSession.busy) { pendingInfoByMultipv.clear(); return; }
     for (const p of pendingInfoByMultipv.values()) {
       socket.emit('connector_analysis_update', p);
     }
@@ -401,6 +445,7 @@ function emitEngineSettings() {
   if (currentConfig?.engineOptions && socket?.connected) {
     const activeEngine = currentConfig.engines?.[currentConfig.defaultEngineUri];
     socket.emit('connector_engine_settings', {
+      ...getConnectorIdentity(),
       Threads: currentConfig.engineOptions.Threads,
       MultiPV: currentConfig.engineOptions.MultiPV,
       // 定跡設定(v6.1.0〜)。サーバーは素通し・旧クライアントは未知フィールドを無視する
@@ -434,7 +479,7 @@ function scheduleEngineIdleShutdown() {
   clearEngineIdleShutdown();
   engineIdleShutdownTimer = setTimeout(async () => {
     engineIdleShutdownTimer = null;
-    if (!isOnDemandEngineMode(currentConfig) || isAnalyzing || batchActive || !engine) return;
+    if (!isOnDemandEngineMode(currentConfig) || isAnalyzing || batchActive || matchSession.busy || !engine) return;
     log('省メモリモード: エンジンを停止してメモリを解放します');
     await stopEngineProcess();
     sendStatus(buildStatus(!!socket?.connected, false));
@@ -465,7 +510,7 @@ async function restartEngineWithConfig(config, reason) {
   if (reason) log(reason);
   isAnalyzing = false;
   const started = await startEngine(config);
-  if (started && engine && wasAnalyzing && resumeSfen) {
+  if (!matchSession.busy && started && engine && wasAnalyzing && resumeSfen) {
     lastSfen = resumeSfen;
     lastTurn = resumeTurn;
     isAnalyzing = true;
@@ -476,6 +521,7 @@ async function restartEngineWithConfig(config, reason) {
 }
 
 async function applyConfigUpdate(nextConfig, prevConfig) {
+  if (matchSession.busy) return { applied: false, reason: 'match_busy' };
   currentConfig = nextConfig;
 
   // 定跡ファイルの変更はエンジンと独立に反映する(解除なら閉じる・変更なら開き直す)
@@ -538,7 +584,8 @@ async function applyConfigUpdate(nextConfig, prevConfig) {
 }
 
 function connectToServer(config) {
-  const normalizedConfig = normalizeConfig(config);
+  const normalizedConfig = normalizeConfig({ ...config, deviceId: currentConfig?.deviceId || config?.deviceId });
+  if (config?.deviceId !== normalizedConfig.deviceId) saveConfig(normalizedConfig);
   currentConfig = normalizedConfig;
   const serverUrl = normalizedConfig.serverUrl;
 
@@ -553,12 +600,15 @@ function connectToServer(config) {
   socket = io(serverUrl, {
     auth: { type: 'connector', token: normalizedConfig.apiKey, ...getConnectorIdentity() }
   });
+  const connection = socket;
 
-  socket.on('connect', () => {
+  socket.on('connect', async () => {
+    await matchSession.transition;
+    if (socket !== connection || !connection.connected) return;
     log(`接続成功 (ID: ${socket.id})`);
     log(`[DIAG] エンジン状態: ${engine?.running ? 'running (PID: ' + engine.pid + ')' : 'stopped'}`);
     log(`[DIAG] 現在の設定: Threads=${normalizedConfig.engineOptions?.Threads || '未設定'}, MultiPV=${normalizedConfig.engineOptions?.MultiPV || '未設定'}, Mode=${getEngineMode(normalizedConfig)}`);
-    socket.emit('connector_ready');
+    socket.emit('connector_ready', getConnectorIdentity());
     sendStatus(buildStatus(true));
     if (isOnDemandEngineMode(normalizedConfig)) {
       log('省メモリモード: 解析開始時にエンジンを起動します');
@@ -577,6 +627,7 @@ function connectToServer(config) {
   });
 
   socket.on('disconnect', (reason) => {
+    void matchSession.disconnected().catch((error) => log(`対局終了処理: ${error.message}`));
     log(`[DIAG] 切断 (reason: ${reason}, engineRunning: ${!!engine?.running})`);
     // 再接続後はサーバーが残りから再バッチするのでローカルキューは破棄。
     // batchActive はループ自身に落とさせる（ここで消すと再接続時に二重ループになる）
@@ -609,8 +660,42 @@ function connectToServer(config) {
     emitEngineSettings();
   });
 
+  socket.on('latency_probe', (ack) => { if (typeof ack === 'function') ack(); });
+  socket.on('connector:match_prepare', async (data, ack) => {
+    markActivity();
+    let result;
+    try { result = await matchSession.prepare(data); }
+    catch (error) { result = { sessionId: data?.sessionId, epoch: data?.epoch, ok: false, error: error.message }; }
+    if (connection.connected && socket === connection) connection.emit('connector:match_ready', result);
+    if (typeof ack === 'function') ack(result);
+  });
+  socket.on('connector:match_search', (data, ack) => {
+    markActivity();
+    try {
+      matchSession.search(data);
+      if (typeof ack === 'function') ack({ ok: true });
+    } catch (error) {
+      const result = { sessionId: data?.sessionId, epoch: data?.epoch, requestId: data?.requestId,
+        ply: data?.ply, positionHash: data?.positionHash, error: error.message };
+      connection.emit('connector:match_error', result);
+      if (typeof ack === 'function') ack({ ok: false, error: error.message });
+    }
+  });
+  for (const operation of ['cancel', 'finish']) {
+    socket.on(`connector:match_${operation}`, async (data, ack) => {
+      markActivity();
+      try {
+        const result = await matchSession[operation](data);
+        if (typeof ack === 'function') ack(result);
+      } catch (error) {
+        if (typeof ack === 'function') ack({ ok: false, error: error.message });
+      }
+    });
+  }
+
   // --- 解析リクエスト ---
-  socket.on('request_analysis', async (data) => {
+  socket.on('request_analysis', async (data, ack) => {
+    if (rejectWhileMatching(ack)) return;
     markActivity();
     const { sfen, turn } = data || {};
     if (!sfen) return;
@@ -625,10 +710,10 @@ function connectToServer(config) {
     if (currentConfig?.useBook && currentConfig?.bookPath) {
       try {
         const b = await ensureBook(currentConfig);
-        if (lastSfen !== requestSfen || lastTurn !== requestTurn) return;
+        if (matchSession.busy || lastSfen !== requestSfen || lastTurn !== requestTurn) return;
         if (b) {
           const bookMoves = await b.searchMoves(sfen);
-          if (lastSfen !== requestSfen || lastTurn !== requestTurn) return;
+          if (matchSession.busy || lastSfen !== requestSfen || lastTurn !== requestTurn) return;
           if (bookMoves.length > 0) {
             // 対話解析セッションとしては扱わない(エンジンは止め、バッチには道を譲る)
             if (isAnalyzing) {
@@ -639,7 +724,7 @@ function connectToServer(config) {
             }
             // 定跡の連鎖でPVを延長(上位10候補のみ・最大10手)
             const extended = await b.extendPvMoves(sfen, bookMoves.slice(0, 10));
-            if (lastSfen !== requestSfen || lastTurn !== requestTurn) return;
+            if (matchSession.busy || lastSfen !== requestSfen || lastTurn !== requestTurn) return;
             emitBookMoves(requestSfen, requestTurn, extended);
             scheduleEngineIdleShutdown();
             return;
@@ -659,7 +744,7 @@ function connectToServer(config) {
         log('解析開始できません: エンジンが起動していません');
         return;
       }
-      if (lastSfen !== requestSfen || lastTurn !== requestTurn) return;
+      if (matchSession.busy || lastSfen !== requestSfen || lastTurn !== requestTurn) return;
     }
     isAnalyzing = true;
     log('解析開始...');
@@ -667,13 +752,15 @@ function connectToServer(config) {
     sendStatus(buildStatus());
     // バッチが MultiPV=1 に切り替えていた場合は設定値へ戻す(通常は no-op)
     await ensureEngineMultiPV(configuredMultiPV());
-    if (lastSfen !== requestSfen || lastTurn !== requestTurn) return;
+    if (matchSession.busy || lastSfen !== requestSfen || lastTurn !== requestTurn) return;
     // UsiEngine 内部で「予約+暗黙stop→bestmove後にposition/go」に直列化される。
     // バッチのmovetime探索中なら結果は破棄され、ループが再キューする。
     engine.analyze(sfen);
   });
 
-  socket.on('stop_analysis', () => {
+  socket.on('stop_analysis', (_data, ack) => {
+    if (typeof _data === 'function') ack = _data;
+    if (rejectWhileMatching(ack)) return;
     markActivity();
     log('解析停止');
     isAnalyzing = false;
@@ -684,10 +771,12 @@ function connectToServer(config) {
     }
     sendStatus(buildStatus());
     scheduleEngineIdleShutdown();
+    if (typeof ack === 'function') ack({ ok: true });
   });
 
   // ★バックグラウンド全解析: サーバーからバッチを受け取り go movetime で逐次解析
-  socket.on('connector:analyze_batch', (data) => {
+  socket.on('connector:analyze_batch', (data, ack) => {
+    if (rejectWhileMatching(ack)) return;
     markActivity();
     const positions = Array.isArray(data?.positions) ? data.positions : [];
     const jobId = typeof data?.jobId === 'string' ? data.jobId : '';
@@ -696,7 +785,8 @@ function connectToServer(config) {
     // サーバーは 1 バッチずつしか送らないのでキューは丸ごと置き換え
     batchQueue = positions
       .filter((p) => p && typeof p.sfen === 'string' && p.sfen.length > 0)
-      .map((p) => ({ jobId, sfen: p.sfen }));
+      .map((p) => ({ jobId, sfen: p.sfen,
+        ...(typeof data.batchEpoch === 'string' ? { batchEpoch: data.batchEpoch } : {}) }));
     const sec = Number(data?.secondsPerMove);
     batchSecondsPerMove = Number.isFinite(sec)
       ? Math.min(30, Math.max(1, Math.floor(sec)))
@@ -717,7 +807,8 @@ function connectToServer(config) {
     sendStatus(buildStatus());
   });
 
-  socket.on('connector:analyze_stop', (data) => {
+  socket.on('connector:analyze_stop', async (data, ack) => {
+    if (rejectWhileMatching(ack)) return;
     markActivity();
     const jobId = typeof data?.jobId === 'string' ? data.jobId : null;
     if (jobId) {
@@ -739,16 +830,25 @@ function connectToServer(config) {
     if (batchActive && engine && !isAnalyzing) {
       engine.stop({ discardSearch: true });
     }
+    try {
+      await batchLoopPromise;
+      if (!isAnalyzing) await engine?.stopAndWait();
+      if (typeof ack === 'function') ack({ ok: true });
+    } catch (error) {
+      if (typeof ack === 'function') ack({ ok: false, error: error.message });
+    }
   });
 
-  socket.on('reset_engine', async () => {
+  socket.on('reset_engine', async (_data, ack) => {
+    if (typeof _data === 'function') ack = _data;
+    if (rejectWhileMatching(ack)) return;
     markActivity();
     if (!engine || !engine.running) return;
     log('エンジンリセット');
     try {
       const wasAnalyzing = isAnalyzing;
       await engine.newGame();
-      if (wasAnalyzing && lastSfen) {
+      if (!matchSession.busy && wasAnalyzing && lastSfen) {
         engine.analyze(lastSfen);
       }
     } catch (e) {
@@ -756,7 +856,8 @@ function connectToServer(config) {
     }
   });
 
-  socket.on('set_engine_option', async (data) => {
+  socket.on('set_engine_option', async (data, ack) => {
+    if (rejectWhileMatching(ack)) return;
     markActivity();
     const { name, value } = data || {};
     if (typeof name !== 'string') return;
@@ -859,7 +960,7 @@ function connectToServer(config) {
       // バッチ探索は破棄され再キューされる。
       await engine.setOptions({ [name]: value });
       if (name === 'MultiPV') engineAppliedMultiPV = Number(value) || engineAppliedMultiPV;
-      if (wasAnalyzing && lastSfen) {
+      if (!matchSession.busy && wasAnalyzing && lastSfen) {
         engine.analyze(lastSfen);
       }
     } catch (e) {
@@ -875,6 +976,7 @@ function connectToServer(config) {
 }
 
 function disconnectFromServer() {
+  void matchSession.disconnected().catch((error) => log(`対局終了処理: ${error.message}`));
   clearEngineIdleShutdown();
   batchQueue = [];
   void closeBook();
@@ -941,7 +1043,7 @@ async function startEngine(config) {
     //     multipv/scoreCP/scoreMate/lowerbound/upperbound/pv[]）。
     //     info(生文字列)は旧クライアント互換のため残す。サーバーは素通しする。
     e.onInfo = ({ sfen, raw, parsed }) => {
-      if (!isAnalyzing) return;
+      if (!isAnalyzing || matchSession.busy) return;
       if (sfen !== lastSfen) return;
       // ★状態パネルのライブ表示(multipv1のみ・スコア無しの nps 行も拾う)
       if (parsed.multipv === undefined || parsed.multipv === 1) noteLiveInfo(parsed);
@@ -961,6 +1063,11 @@ async function startEngine(config) {
       engineAppliedMultiPV = null;
       sendStatus(buildStatus(!!socket?.connected, false));
 
+      if (matchSession.busy) {
+        matchSession.engineFailed(reason || 'エンジンが異常終了しました');
+        return;
+      }
+
       // ★エンジン自動再起動（意図しないクラッシュ・応答不能時）
       const shouldRestart = currentConfig && socket?.connected &&
         (!isOnDemandEngineMode(currentConfig) || wasAnalyzing || batchActive);
@@ -974,6 +1081,7 @@ async function startEngine(config) {
       engineRestartTimestamps.push(now);
       log(`⚠️ エンジンが異常終了しました。自動再起動します... (${engineRestartTimestamps.length}/${ENGINE_RESTART_LIMIT})`);
       setTimeout(async () => {
+        if (matchSession.busy) return;
         const started = await startEngine(currentConfig);
         if (started && engine && wasAnalyzing && lastSfen) {
           // 再起動後はハッシュが空の状態からの再解析になる（結果は新規探索として届く）
@@ -992,7 +1100,7 @@ async function startEngine(config) {
       log(`エンジン準備完了: ${res.id.name || path.basename(enginePath)}`);
       // 登録簿の使用中エントリへ USI id name/author を記録する(表示・将来のカタログ同期用)
       try {
-        const uri = currentConfig?.defaultEngineUri;
+        const uri = normalizedConfig.defaultEngineUri;
         const entry = uri ? currentConfig?.engines?.[uri] : null;
         const idName = String(res.id.name || '');
         const idAuthor = String(res.id.author || '');
@@ -1035,10 +1143,11 @@ async function startEngine(config) {
 
 // --- バックグラウンド全解析ループ ---
 function startBatchLoop() {
-  if (batchActive) return;
+  if (batchActive || matchSession.busy) return;
   batchActive = true;
-  (async () => {
+  batchLoopPromise = (async () => {
     while (batchQueue.length > 0) {
+      if (matchSession.busy) { batchQueue = []; break; }
       if (!socket?.connected) {
         batchQueue = [];
         break;
@@ -1066,16 +1175,17 @@ function startBatchLoop() {
       // ★バッチは multipv1 の結果しか使わないので MultiPV=1 で探索する(深さ優先)。
       //   対話解析が割り込むと request_analysis 側で設定値へ戻る
       await ensureEngineMultiPV(1);
-      if (isAnalyzing || !engine || !engine.running) {
+      if (matchSession.busy || isAnalyzing || !engine || !engine.running) {
         // setoption 待ちの間に割り込み/エンジン停止 → 再キューしてループ先頭の処理に任せる
-        batchQueue.unshift(item);
+        if (!matchSession.busy) batchQueue.unshift(item);
         continue;
       }
 
-      const res = await engine.search(item.sfen, batchSecondsPerMove * 1000);
+      const res = await engine.search(item.sfen, { type: 'movetime', movetimeMs: batchSecondsPerMove * 1000 });
       if (res.status === 'done') {
-        if (socket?.connected) {
-          const payload = { jobId: item.jobId, sfen: item.sfen };
+        if (socket?.connected && !matchSession.busy && !stoppedBatchJobs.has(item.jobId)) {
+          const payload = { jobId: item.jobId, sfen: item.sfen,
+            ...(item.batchEpoch ? { batchEpoch: item.batchEpoch } : {}) };
           const lp = res.lastParsed;
           if (lp) {
             if (lp.scoreMate !== undefined) payload.scoreMate = lp.scoreMate;
@@ -1094,24 +1204,26 @@ function startBatchLoop() {
         }
       } else {
         // preempted: 対話解析・切断・エンジン再起動などで破棄された → 再キュー
-        if (!stoppedBatchJobs.has(item.jobId)) {
+        if (!matchSession.busy && !stoppedBatchJobs.has(item.jobId)) {
           batchQueue.unshift(item);
         }
         await sleep(200);
       }
     }
-    batchActive = false;
     // バッチが MultiPV=1 に切り替えていた場合は設定値へ復元
     await ensureEngineMultiPV(configuredMultiPV());
+    batchActive = false;
     sendStatus(buildStatus());
     scheduleEngineIdleShutdown();
   })().catch((err) => {
     log(`バッチ解析ループエラー: ${err?.message || err}`);
     batchActive = false;
     batchQueue = [];
-    void ensureEngineMultiPV(configuredMultiPV());
+    // Match preparation awaits this whole promise, including option restoration.
+    return ensureEngineMultiPV(configuredMultiPV()).finally(() => {
     sendStatus(buildStatus());
     scheduleEngineIdleShutdown();
+    });
   });
 }
 
@@ -1126,11 +1238,12 @@ function setupIPC() {
 
   ipcMain.handle('save-config', async (_, config) => {
     markActivity();
+    if (matchSession.busy) return { ok: false, error: 'Connector対局中は設定を変更できません' };
     if (!config || typeof config !== 'object' || typeof config.apiKey !== 'string' || typeof config.enginePath !== 'string') {
       return { ok: false };
     }
     const prevConfig = currentConfig ? normalizeConfig(currentConfig) : null;
-    const nextConfig = normalizeConfig(config);
+    const nextConfig = normalizeConfig({ ...config, deviceId: prevConfig?.deviceId || config.deviceId });
     saveConfig(nextConfig);
     const result = await applyConfigUpdate(nextConfig, prevConfig);
     return { ok: true, ...result };
@@ -1221,6 +1334,7 @@ function setupIPC() {
 
   ipcMain.handle('connect', (_, config) => {
     markActivity();
+    if (matchSession.busy) return false;
     connectToServer(config);
     return true;
   });
@@ -1248,6 +1362,7 @@ function setupIPC() {
   });
   ipcMain.handle('install-update', () => {
     markActivity();
+    if (matchSession.busy) { log('対局終了後にアップデートを適用できます'); return false; }
     disconnectFromServer();
     autoUpdater.quitAndInstall(true, true);
   });
@@ -1316,6 +1431,7 @@ function createTray() {
       {
         label: '再接続',
         click: () => {
+          if (matchSession.busy) { log('対局終了後に再接続できます'); return; }
           const cfg = currentConfig || loadConfig();
           if (cfg?.apiKey && cfg?.enginePath) {
             disconnectFromServer();
@@ -1337,7 +1453,7 @@ function createTray() {
 function updateTrayTooltip(status) {
   if (!tray) return;
   const conn = status?.connected ? 'オンライン' : 'オフライン';
-  const engineState = status?.analyzing
+  const engineState = status?.matchActive ? '対局中' : status?.analyzing
     ? '解析中'
     : status?.batch
       ? `全解析 ${status.batch.done}/${status.batch.total}`
@@ -1465,6 +1581,7 @@ function canInstallDownloadedUpdate() {
   return updateReadyToInstall
     && idleMs >= UPDATE_IDLE_INSTALL_DELAY_MS
     && !isAnalyzing
+    && !matchSession.busy
     && !batchActive;
 }
 

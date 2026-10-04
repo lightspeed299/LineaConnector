@@ -109,6 +109,16 @@ rl.on('line', (raw) => {
     }, ms);
     return;
   }
+  if (line.startsWith('go btime')) {
+    if (has('crash-on-go')) process.exit(42);
+    searching = true;
+    if (has('wait-for-stop') || has('no-bestmove')) return;
+    movetimeTimer = setTimeout(() => {
+      out(has('resign') ? 'bestmove resign' : has('win') ? 'bestmove win' : 'bestmove 7g7f');
+      searching = false;
+    }, 80);
+    return;
+  }
   if (line === 'stop') {
     if (has('no-bestmove')) return;
     stopSearch(true);

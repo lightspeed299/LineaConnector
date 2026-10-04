@@ -4,8 +4,69 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
 const { UsiEngine, SCORE_MATE_UNKNOWN, STATE } = require('../usi-engine.js');
+const { clockCommand, matchPosition } = require('../usi-engine.js');
 
 const MOCK = path.join(__dirname, 'mock-usi-engine.js');
+const STARTPOS = 'lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1';
+
+test('対局 clock コマンドは秒読み/Fischerを混在させず履歴を送る', async () => {
+  await withEngine({}, async (engine) => {
+    await engine.launch();
+    await engine.search(STARTPOS, { type: 'clock', moves: ['7g7f', '3c3d'],
+      clock: { btime: 5000, wtime: 6000, byoyomi: 30000 }, timeoutMs: 1000 });
+    assert.ok(sent(engine).includes(`position sfen ${STARTPOS} moves 7g7f 3c3d`));
+    assert.ok(sent(engine).includes('go btime 5000 wtime 6000 byoyomi 30000'));
+    await engine.search(STARTPOS, { type: 'clock', moves: [],
+      clock: { btime: 200, wtime: 400, binc: 0, winc: 0 }, timeoutMs: 1000 });
+    assert.ok(sent(engine).includes('go btime 200 wtime 400 binc 0 winc 0'));
+    await engine.gameOver('win');
+    assert.equal(sent(engine).at(-1), 'gameover win');
+  });
+});
+
+test('対局パラメータの不正値・USIコマンド注入を拒否', () => {
+  assert.equal(clockCommand({ btime: 4_200_000, wtime: 4_000_000, binc: 60_000, winc: 60_000 }),
+    'go btime 4200000 wtime 4000000 binc 60000 winc 60000'); // accumulated increments may exceed the initial-time cap
+  for (const clock of [{ btime: -1, wtime: 0 }, { btime: NaN, wtime: 0 },
+    { btime: 0, wtime: 0, byoyomi: 1, binc: 1, winc: 1 }, { btime: 0, wtime: 0, binc: 1 },
+    { btime: 1.2, wtime: 0 }, { btime: 0, wtime: Infinity }]) assert.throws(() => clockCommand(clock));
+  assert.throws(() => matchPosition(`${STARTPOS}\nquit`, []));
+  assert.throws(() => matchPosition(STARTPOS, ['7g7f\nquit']));
+  assert.throws(() => matchPosition(STARTPOS, ['P*0a']));
+});
+
+test('対局取消はstop bestmove排出まで待ち、次探索へ誤帰属しない', async () => {
+  await withEngine({ behaviors: ['wait-for-stop'] }, async (engine) => {
+    await engine.launch();
+    const result = engine.search(STARTPOS, { type: 'clock', moves: [],
+      clock: { btime: 10000, wtime: 10000, byoyomi: 0 }, timeoutMs: 1000 });
+    await engine.stopAndWait();
+    assert.equal((await result).status, 'preempted');
+    assert.equal(engine.state, STATE.READY);
+    const next = await engine.search(STARTPOS, { type: 'movetime', movetimeMs: 50 });
+    assert.equal(next.status, 'done');
+    await engine.gameOver(null);
+    assert.equal(sent(engine).some((line) => line === 'gameover null'), false);
+  });
+});
+
+test('時計探索はresign/winを失わず返し、期限でstopする', async () => {
+  for (const bestmove of ['resign', 'win']) {
+    await withEngine({ behaviors: [bestmove] }, async (engine) => {
+      await engine.launch();
+      const result = await engine.search(STARTPOS, { type: 'clock', moves: [],
+        clock: { btime: 0, wtime: 0, byoyomi: 1000 }, timeoutMs: 1000 });
+      assert.equal(result.bestmove, bestmove);
+    });
+  }
+  await withEngine({ behaviors: ['wait-for-stop'] }, async (engine) => {
+    await engine.launch();
+    const result = await engine.search(STARTPOS, { type: 'clock', moves: [],
+      clock: { btime: 0, wtime: 0, byoyomi: 100 }, timeoutMs: 100 });
+    assert.equal(result.status, 'done');
+    assert.ok(sent(engine).includes('stop'));
+  });
+});
 
 function makeEngine({ behaviors = [], engineOptions = {}, timeouts = {} } = {}) {
   return new UsiEngine({
@@ -138,7 +199,7 @@ test('stop: 重複送信されず、予約goも取り消される', async () => 
 test('search(movetime): 完走してbestmoveと最終評価を返す', async () => {
   await withEngine({}, async (engine) => {
     await engine.launch();
-    const res = await engine.search('POS_A', 150);
+    const res = await engine.search('POS_A', { type: 'movetime', movetimeMs: 150 });
     assert.equal(res.status, 'done');
     assert.equal(res.bestmove, '7g7f');
     assert.equal(res.lastParsed.scoreCP, 55);
@@ -149,7 +210,7 @@ test('search(movetime): 完走してbestmoveと最終評価を返す', async () 
 test('preempt: movetime探索中のanalyzeで結果は破棄され、後で対話goが走る', async () => {
   await withEngine({}, async (engine) => {
     await engine.launch();
-    const p = engine.search('POS_BATCH', 5000);
+    const p = engine.search('POS_BATCH', { type: 'movetime', movetimeMs: 5000 });
     await waitFor(() => sent(engine).some((l) => l.startsWith('go movetime')), 3000, 'movetime go');
     engine.analyze('POS_LIVE');
     const res = await p;
@@ -245,7 +306,7 @@ test('探索中クラッシュ: searchはpreemptedになり異常終了が通知
   let closed = null;
   engine.onUnexpectedClose = (x) => { closed = x; };
   await engine.launch();
-  const res = await engine.search('POS_A', 1000);
+  const res = await engine.search('POS_A', { type: 'movetime', movetimeMs: 1000 });
   assert.equal(res.status, 'preempted');
   await waitFor(() => closed !== null, 5000, 'close event');
   assert.equal(closed.code, 42);
@@ -263,7 +324,7 @@ test('quit: 正常終了しstateがCLOSEDになる(冪等)', async () => {
 test('stderr大量出力でも詰まらない(drain)', async () => {
   await withEngine({ behaviors: ['stderr-spam'] }, async (engine) => {
     await engine.launch();
-    const res = await engine.search('POS_A', 100);
+    const res = await engine.search('POS_A', { type: 'movetime', movetimeMs: 100 });
     assert.equal(res.status, 'done');
     assert.ok(engine.stderrTail.length > 0);
   });
@@ -273,7 +334,7 @@ test('未flushの予約search(初期化中)がstopで宙吊りにならずpreemp
   await withEngine({ behaviors: ['slow-readyok'] }, async (engine) => {
     await engine.launch(); // launch自体のreadyokも150ms遅い
     const ng = engine.newGame(); // 適用サイクル開始(150msのINITIALIZING窓)
-    const p = engine.search('POS_PENDING', 1000); // 予約だけされ、まだflushされない
+    const p = engine.search('POS_PENDING', { type: 'movetime', movetimeMs: 1000 }); // 予約だけされ、まだflushされない
     engine.stop(); // 予約を取り消す
     const res = await p;
     assert.equal(res.status, 'preempted');
@@ -286,7 +347,7 @@ test('未flushの予約searchがanalyzeの上書きでもpreempted解決され�
   await withEngine({ behaviors: ['slow-readyok'] }, async (engine) => {
     await engine.launch();
     const ng = engine.newGame();
-    const p = engine.search('POS_PENDING', 1000);
+    const p = engine.search('POS_PENDING', { type: 'movetime', movetimeMs: 1000 });
     engine.analyze('POS_LIVE'); // 予約を上書き
     const res = await p;
     assert.equal(res.status, 'preempted');

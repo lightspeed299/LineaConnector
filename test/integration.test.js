@@ -53,7 +53,8 @@ test('E2E: request_analysis / batch / set_engine_option / reset_engine の全経
     if (s.handshake.auth?.type !== 'connector') { s.disconnect(); return; }
     connSocket = s;
     push('connected', s.handshake.auth);
-    for (const ev of ['connector_ready', 'connector_analysis_update', 'connector_engine_settings', 'connector:analysis_result']) {
+    for (const ev of ['connector_ready', 'connector_analysis_update', 'connector_engine_settings', 'connector:analysis_result',
+      'connector:match_ready', 'connector:match_result', 'connector:match_error']) {
       s.on(ev, (data) => push(ev, data));
     }
   });
@@ -100,6 +101,9 @@ test('E2E: request_analysis / batch / set_engine_option / reset_engine の全経
     assert.equal(conn.data.type, 'connector');
     assert.match(String(conn.data.version), /^v\d+\./);
     assert.ok(conn.data.deviceName.length > 0);
+    assert.match(conn.data.deviceId, /^[a-f0-9-]{36}$/);
+    assert.equal(conn.data.capabilities.connectorMatchV1, true);
+    assert.equal(conn.data.protocolVersion, 1);
     await waitEvent((e) => e.name === 'connector_ready', 5000, 'connector_ready');
 
     // 対話解析
@@ -196,6 +200,53 @@ test('E2E: request_analysis / batch / set_engine_option / reset_engine の全経
     // 最後にもう一度停止(後片付け)
     connSocket.emit('stop_analysis', {});
     await sleep(300);
+
+    const command = (name, data) => new Promise((resolve, reject) => {
+      connSocket.timeout(20000).emit(name, data, (error, response) => error ? reject(error) : resolve(response));
+    });
+    const probe = await new Promise((resolve, reject) => connSocket.timeout(1000).emit('latency_probe',
+      (error) => error ? reject(error) : resolve(true)));
+    assert.equal(probe, true);
+    connSocket.emit('request_engine_settings');
+    await sleep(150);
+    const settings = events.filter((e) => e.name === 'connector_engine_settings').at(-1).data;
+    assert.equal(settings.deviceId, conn.data.deviceId);
+    const prepared = { sessionId: 'match1', epoch: 1, engineUri: settings.activeEngineUri, protocolVersion: 1 };
+
+    // Pause an active batch before acquiring the match lease; ACK includes final option restoration.
+    connSocket.emit('connector:analyze_batch', { jobId: 'matchPausedJob', positions: [{ sfen: POS_A }], secondsPerMove: 3 });
+    await sleep(120);
+    assert.equal((await command('connector:analyze_stop', { jobId: 'matchPausedJob', reason: 'connector_match' })).ok, true);
+    assert.equal((await command('connector:match_prepare', prepared)).ok, true);
+    const ready = await waitEvent((e) => e.name === 'connector:match_ready' && e.data?.sessionId === 'match1', 1000, 'match ready');
+    assert.equal(ready.data.deviceId, conn.data.deviceId);
+    for (const [name, data] of [['request_analysis', { sfen: STARTPOS, turn: 'b' }], ['stop_analysis', {}],
+      ['reset_engine', {}], ['set_engine_option', { name: 'MultiPV', value: 9 }],
+      ['connector:analyze_batch', { jobId: 'blocked', positions: [{ sfen: POS_A }], secondsPerMove: 1 }]]) {
+      assert.equal((await command(name, data)).ok, false, `${name} is rejected during match`);
+    }
+    const search = { sessionId: 'match1', epoch: 1, requestId: 'request1', ply: 2, positionHash: 'hash2',
+      rootInitialSfen: STARTPOS, moves: ['7g7f', '3c3d'], clock: { btime: 5000, wtime: 5000, byoyomi: 1000 }, timeoutMs: 1000 };
+    assert.equal((await command('connector:match_search', search)).ok, true);
+    const move = await waitEvent((e) => e.name === 'connector:match_result' && e.data?.requestId === 'request1', 2000, 'match bestmove');
+    assert.equal(move.data.bestmove, '7g7f');
+    assert.equal(move.data.positionHash, 'hash2');
+    assert.equal((await command('connector:match_search', { ...search, requestId: 'cancelled' })).ok, true);
+    assert.equal((await command('connector:match_cancel', { ...prepared, requestId: 'cancelled' })).ok, true);
+    await sleep(150);
+    assert.equal(countOf('connector:match_result', (e) => e.data.requestId === 'cancelled'), 0);
+    assert.equal((await command('connector:match_prepare', { ...prepared, epoch: 2 })).ok, true);
+    assert.equal((await command('connector:match_search', search)).ok, false, 'old epoch rejected');
+    const finish = { ...prepared, epoch: 2, result: 'win' };
+    assert.equal((await command('connector:match_finish', finish)).ok, true);
+    assert.equal((await command('connector:match_finish', finish)).ok, true, 'finish ACK is repeatable');
+    connSocket.emit('request_engine_settings');
+    await sleep(150);
+    assert.equal(events.filter((e) => e.name === 'connector_engine_settings').at(-1).data.MultiPV, 2);
+    const beforeRestored = countOf('connector_analysis_update');
+    connSocket.emit('request_analysis', { sfen: STARTPOS, turn: 'b' });
+    await waitEvent(() => countOf('connector_analysis_update') > beforeRestored, 15000, 'analysis resumes after match');
+    await command('stop_analysis', {});
   } catch (err) {
     err.message += `\n--- electron main log ---\n${mainLog.slice(-4000)}`;
     throw err;

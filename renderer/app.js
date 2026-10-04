@@ -255,8 +255,8 @@
     $('#conn-text').textContent = connected ? 'オンライン' : 'オフライン';
 
     // 待機中は1行のみ。何か起きているときだけ下段(ライブ統計/進捗/再接続)が出現する
-    const showLive = connected && status.analyzing;
-    const showBatch = connected && !status.analyzing && !!status.batch;
+    const showLive = connected && !status.matchActive && status.analyzing;
+    const showBatch = connected && !status.matchActive && !status.analyzing && !!status.batch;
     const showExtra = showLive || showBatch || !connected;
     $('#status-extra').classList.toggle('hidden', !showExtra);
     $('#strip-live').classList.toggle('hidden', !showLive);
@@ -265,6 +265,11 @@
 
     if (!connected) {
       setChip('切断', 'red');
+      return;
+    }
+
+    if (status.matchActive) {
+      setChip('対局中', 'amber');
       return;
     }
 
@@ -590,12 +595,13 @@
               ? '設定を保存しました（次回解析時に反映）'
               : '設定を保存しました');
       } else {
-        addLocalLog('⚠ 設定を保存できませんでした');
+        addLocalLog(`⚠ ${result?.error || '設定を保存できませんでした'}`);
       }
     });
 
     // Reconnect（設定パネルと状態パネルの両方から）
     const reconnect = async () => {
+      if (lastStatus?.matchActive) { addLocalLog('対局終了後に再接続できます'); return; }
       await window.connector.disconnect();
       const freshConfig = await window.connector.getConfig();
       if (freshConfig) {

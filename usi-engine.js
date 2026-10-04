@@ -46,6 +46,35 @@ function sanitizeUSI(str) {
   return String(str).replace(/[\r\n\x00-\x1f]/g, '');
 }
 
+function clockCommand(clock) {
+  if (!clock || typeof clock !== 'object') throw new Error('Invalid clock');
+  const keys = ['btime', 'wtime', 'byoyomi', 'binc', 'winc'];
+  if (Object.keys(clock).some((key) => !keys.includes(key))) throw new Error('Invalid clock field');
+  for (const key of keys) {
+    if (clock[key] !== undefined && (!Number.isSafeInteger(clock[key]) || clock[key] < 0 || clock[key] > 250_000_000)) {
+      throw new Error('Invalid clock time');
+    }
+  }
+  if (clock.btime === undefined || clock.wtime === undefined) throw new Error('Missing remaining time');
+  if (clock.byoyomi !== undefined && (clock.binc !== undefined || clock.winc !== undefined)) throw new Error('Mixed clock modes');
+  if ((clock.binc === undefined) !== (clock.winc === undefined)) throw new Error('Missing increment');
+  let command = `go btime ${clock.btime} wtime ${clock.wtime}`;
+  if (clock.binc !== undefined) return `${command} binc ${clock.binc} winc ${clock.winc}`;
+  return `${command} byoyomi ${clock.byoyomi ?? 0}`;
+}
+
+function matchPosition(rootInitialSfen, moves) {
+  if (typeof rootInitialSfen !== 'string' || rootInitialSfen.length > 256 ||
+      !/^[1-9plnsgbrkPLNSGBRK+/]+ [bw] (?:-|[0-9PLNSGBRplnsgbr]+) [1-9][0-9]*$/.test(rootInitialSfen)) {
+    throw new Error('Invalid starting SFEN');
+  }
+  if (!Array.isArray(moves) || moves.length > 4096 || moves.some((move) =>
+    typeof move !== 'string' || !/^(?:[1-9][a-i][1-9][a-i]\+?|[PLNSGBR]\*[1-9][a-i])$/.test(move))) {
+    throw new Error('Invalid move history');
+  }
+  return `position sfen ${rootInitialSfen}${moves.length ? ` moves ${moves.join(' ')}` : ''}`;
+}
+
 // "score mate +" / "-" / "+0" / "0" / "-0" → ±SCORE_MATE_UNKNOWN(手数未確定)
 function parseScoreMate(arg) {
   switch (arg) {
@@ -519,9 +548,11 @@ class UsiEngine {
 
   _flushGo(go) {
     const sfen = sanitizeUSI(go.sfen);
-    this._write(`position sfen ${sfen}`);
+    this._write(go.spec.positionCommand || `position sfen ${sfen}`);
     if (go.spec.movetimeMs) {
       this._write(`go movetime ${Math.floor(go.spec.movetimeMs)}`);
+    } else if (go.spec.clockCommand) {
+      this._write(go.spec.clockCommand);
     } else {
       this._write('go infinite');
     }
@@ -529,14 +560,14 @@ class UsiEngine {
     this.currentGoSfen = go.sfen;
     this._stopSent = false;
 
-    if (go.spec.movetimeMs && go.spec.ticket) {
+    if (go.spec.ticket) {
       const cs = go.spec.ticket;
       cs.sfen = go.sfen;
       this.currentSearch = cs;
       // movetime を大幅超過しても bestmove が来ない場合は stop → (stopGuard) → wedge
-      this._setTimer('searchGuard', go.spec.movetimeMs + 15000, () => {
+      this._setTimer('searchGuard', go.spec.timeoutMs ?? (go.spec.movetimeMs + 15000), () => {
         if (this.currentSearch === cs) {
-          this.log('movetime 超過: stop を送信します');
+          this.log('探索期限: stop を送信します');
           this._sendStop();
         }
       });
@@ -585,7 +616,16 @@ class UsiEngine {
    *   {status:'done', bestmove, lastParsed} | {status:'preempted'}
    * preempted は「結果を捨てて再キューせよ」の意味。
    */
-  search(sfen, movetimeMs) {
+  search(sfen, limit) {
+    let spec;
+    if (limit?.type === 'clock') {
+      if (!Number.isSafeInteger(limit.timeoutMs) || limit.timeoutMs < 1 || limit.timeoutMs > 250_000_000) throw new Error('Invalid search timeout');
+      spec = { positionCommand: matchPosition(sfen, limit.moves), clockCommand: clockCommand(limit.clock), timeoutMs: limit.timeoutMs };
+    } else if (limit?.type === 'movetime' && Number.isSafeInteger(limit.movetimeMs) && limit.movetimeMs > 0 && limit.movetimeMs <= 3_900_000) {
+      spec = { movetimeMs: limit.movetimeMs };
+    } else {
+      throw new Error('Invalid search limit');
+    }
     return new Promise((resolve) => {
       if (!this.running) { resolve({ status: 'preempted' }); return; }
       const ticket = { resolve, lastParsed: null, settled: false };
@@ -597,7 +637,7 @@ class UsiEngine {
         this.currentSearch = null;
       }
       this._dropReservedGo();
-      this.reservedGo = { sfen, spec: { movetimeMs, ticket } };
+      this.reservedGo = { sfen, spec: { ...spec, ticket } };
       this._dispatch();
     });
   }
@@ -637,6 +677,22 @@ class UsiEngine {
       this._clearTimer('searchGuard');
     }
     this._sendStop();
+  }
+
+  /** Resolve only after the cancelled bestmove and queued option applications drain. */
+  async stopAndWait() {
+    if (!this.running) return;
+    const idle = new Promise((resolve) => this.readyWaiters.push(resolve));
+    this.stop({ discardSearch: true });
+    if (this.state === STATE.READY) this._afterIdle();
+    await idle;
+    if (!this.running || this.state !== STATE.READY) throw new Error('Engine stopped before ready');
+  }
+
+  async gameOver(result) {
+    if (![null, 'win', 'lose', 'draw'].includes(result)) throw new Error('Invalid game result');
+    await this.stopAndWait();
+    if (result !== null && this.running) this._write(`gameover ${result}`);
   }
 
   /**
@@ -747,4 +803,4 @@ class UsiEngine {
   }
 }
 
-module.exports = { UsiEngine, parseUsiInfo, parseScoreMate, SCORE_MATE_UNKNOWN, STATE, DEFAULT_TIMEOUTS };
+module.exports = { UsiEngine, parseUsiInfo, parseScoreMate, SCORE_MATE_UNKNOWN, STATE, DEFAULT_TIMEOUTS, clockCommand, matchPosition };

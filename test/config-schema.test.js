@@ -1,5 +1,15 @@
 'use strict';
 
+// The identity persists through normalizing, saving and loading, regardless of hostname.
+require('node:test').test('永続deviceIdは初回のみ生成し正規化で維持', () => {
+  const assert = require('node:assert/strict');
+  const { normalizeConfig } = require('../config-schema');
+  const first = normalizeConfig({});
+  assert.match(first.deviceId, /^[a-f0-9-]{36}$/);
+  assert.equal(normalizeConfig(first).deviceId, first.deviceId);
+  assert.notEqual(normalizeConfig({}).deviceId, first.deviceId);
+});
+
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {

@@ -9,6 +9,7 @@ module.exports = {
     'main.js',
     'config-schema.js',
     'usi-engine.js',
+    'match-session.js',
     'book.js',
     'book-ybb.js',
     'packed-sfen.js',

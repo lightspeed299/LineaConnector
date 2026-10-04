@@ -166,6 +166,8 @@ function uniquifyBookNames(books) {
 function normalizeConfig(config) {
   const base = {
     ...config,
+    deviceId: typeof config?.deviceId === 'string' && /^[a-f0-9-]{36}$/i.test(config.deviceId)
+      ? config.deviceId : crypto.randomUUID(),
     serverUrl: normalizeServerUrl(config?.serverUrl),
     engineMode: getEngineMode(config),
     engineOptions: normalizeEngineOptions(config?.engineOptions),

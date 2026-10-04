@@ -3,6 +3,7 @@
 'use strict';
 
 const { UsiEngine } = require('../usi-engine.js');
+const assert = require('node:assert/strict');
 
 const STARTPOS = 'lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1';
 const AFTER_76FU = 'lnsgkgsnl/1r5b1/ppppppppp/9/9/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL w - 2';
@@ -63,13 +64,28 @@ async function main() {
 
   console.log('--- search movetime 1000 ---');
   const t2 = Date.now();
-  const r1 = await engine.search(AFTER_76FU, 1000);
+  const r1 = await engine.search(AFTER_76FU, { type: 'movetime', movetimeMs: 1000 });
   console.log(`search done in ${Date.now() - t2}ms: ${JSON.stringify(r1)}`);
 
   console.log('--- newGame + search 500 ---');
   await engine.newGame();
-  const r2 = await engine.search(STARTPOS, 500);
+  const r2 = await engine.search(STARTPOS, { type: 'movetime', movetimeMs: 500 });
   console.log(`result: status=${r2.status} bestmove=${r2.bestmove} score=${r2.lastParsed ? r2.lastParsed.scoreCP : '(none)'}`);
+
+  for (const [label, clock] of [
+    ['byoyomi', { btime: 0, wtime: 0, byoyomi: 1000 }],
+    ['fischer', { btime: 500, wtime: 500, binc: 500, winc: 500 }],
+    ['short-fischer', { btime: 100, wtime: 100, binc: 0, winc: 0 }],
+  ]) {
+    await engine.newGame();
+    await engine.setOptions({ MultiPV: 1, USI_Ponder: false });
+    const started = Date.now();
+    const result = await engine.search(STARTPOS, { type: 'clock', moves: ['7g7f', '3c3d'], clock, timeoutMs: 1200 });
+    assert.equal(result.status, 'done');
+    assert.match(result.bestmove, /^(?:[1-9][a-i][1-9][a-i]\+?|[PLNSGBR]\*[1-9][a-i])$/);
+    console.log(`${label}: bestmove=${result.bestmove} elapsed=${Date.now() - started}ms`);
+    await engine.gameOver('draw');
+  }
 
   console.log('--- quit ---');
   await engine.quit();
