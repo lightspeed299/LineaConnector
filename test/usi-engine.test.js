@@ -207,6 +207,24 @@ test('search(movetime): 完走してbestmoveと最終評価を返す', async () 
   });
 });
 
+test('search(infinite): 相手番の考慮はstopまで続き、最後の読み筋を返す', async () => {
+  await withEngine({}, async (engine) => {
+    await engine.launch();
+    const pending = engine.search(STARTPOS, { type: 'infinite', moves: ['7g7f'] });
+    await waitFor(() => sent(engine).includes('go infinite'), 5000, 'go infinite');
+    assert(sent(engine).includes(`position sfen ${STARTPOS} moves 7g7f`), 'the game history is sent, not a bare position');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(engine.state, STATE.SEARCHING, 'no search deadline stops the analysis by itself');
+    engine.stop();
+    const res = await pending;
+    assert.equal(res.status, 'done');
+    assert(res.lastParsed.depth > 0);
+    assert.deepEqual(res.lastParsed.pv, ['7g7f', '3c3d', '2g2f']);
+    const next = await engine.search('POS_A', { type: 'movetime', movetimeMs: 50 });
+    assert.equal(next.status, 'done', 'the engine is ready for the reply search right after');
+  });
+});
+
 test('preempt: movetime探索中のanalyzeで結果は破棄され、後で対話goが走る', async () => {
   await withEngine({}, async (engine) => {
     await engine.launch();

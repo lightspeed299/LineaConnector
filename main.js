@@ -681,6 +681,11 @@ function connectToServer(config) {
       if (typeof ack === 'function') ack({ ok: false, error: error.message });
     }
   });
+  // Linea asks for the human's turn to be analyzed when it starts without a reply of ours before it.
+  socket.on('connector:match_ponder', (data) => {
+    markActivity();
+    try { matchSession.ponder(data); } catch (error) { log(`対局の考慮を開始できません: ${error.message}`); }
+  });
   for (const operation of ['cancel', 'finish']) {
     socket.on(`connector:match_${operation}`, async (data, ack) => {
       markActivity();

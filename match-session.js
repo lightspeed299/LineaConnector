@@ -17,6 +17,30 @@ function envelope(data) {
     ply: data.ply, positionHash: data.positionHash };
 }
 
+// Linea keeps the same reading length as its game-room analysis.
+const PV_LIMIT = 12;
+const USI_MOVE = /^(?:[1-9][a-i][1-9][a-i]\+?|[PLNSGBR]\*[1-9][a-i])$/;
+
+/** The last principal-variation info of a search, as Linea records it (score from the side to move). */
+function thinking(parsed) {
+  if (!parsed) return undefined;
+  const out = {};
+  if (Number.isFinite(parsed.scoreCP)) out.scoreCp = Math.trunc(parsed.scoreCP);
+  else if (Number.isFinite(parsed.scoreMate)) out.scoreMate = Math.trunc(parsed.scoreMate);
+  else return undefined;
+  if (parsed.lowerbound) out.bound = 'lower';
+  else if (parsed.upperbound) out.bound = 'upper';
+  for (const key of ['depth', 'seldepth', 'nodes', 'timeMs']) {
+    if (Number.isSafeInteger(parsed[key]) && parsed[key] >= 0) out[key] = parsed[key];
+  }
+  if (Array.isArray(parsed.pv)) {
+    const pv = [];
+    for (const move of parsed.pv) { if (!USI_MOVE.test(move) || pv.length >= PV_LIMIT) break; pv.push(move); }
+    if (pv.length) out.pv = pv;
+  }
+  return out;
+}
+
 class MatchSession {
   constructor(hooks) {
     this.hooks = hooks;
@@ -103,23 +127,70 @@ class MatchSession {
     // Each match is bounded to 4096 plies, including cancelled/retried requests.
     const engine = this.hooks.engine();
     if (!engine?.running) { session.request = null; throw new Error('Engine unavailable'); }
-    void engine.search(data.rootInitialSfen, { type: 'clock', moves: data.moves, clock: data.clock, timeoutMs: data.timeoutMs })
+    const run = () => engine.search(data.rootInitialSfen, { type: 'clock', moves: data.moves, clock: data.clock, timeoutMs: data.timeoutMs });
+    // The human's turn was analyzed in the meantime; stop it and report it with this reply.
+    const ponder = session.ponder;
+    session.ponder = null;
+    let opponentThink;
+    const searched = !ponder ? run() : this._finishPonder(engine, ponder, data).then((result) => {
+      opponentThink = result;
+      if (this.session !== session || session.request !== request || session.finished) return { status: 'stale' };
+      return run();
+    });
+    void searched
       .then((result) => {
-        if (this.session !== session || session.request !== request || session.finished) return;
+        if (result.status === 'stale' || this.session !== session || session.request !== request || session.finished) return;
         session.request = null;
         if (result.status !== 'done') {
           session.ready = false;
           this.hooks.emit('connector:match_error', { ...envelope(data), error: 'Engine search interrupted' });
           return;
         }
-        request.result = { ...envelope(data), bestmove: result.bestmove };
+        const think = thinking(result.lastParsed);
+        request.result = { ...envelope(data), bestmove: result.bestmove,
+          ...(think ? { think } : {}), ...(opponentThink ? { opponentThink } : {}) };
         this.hooks.emit('connector:match_result', request.result);
+        this._startPonder(session, engine, data.rootInitialSfen, [...data.moves, result.bestmove]);
       }).catch((error) => {
         if (this.session !== session || session.request !== request || session.finished) return;
         session.request = null;
         session.ready = false;
         this.hooks.emit('connector:match_error', { ...envelope(data), error: error.message });
       });
+  }
+
+  /**
+   * Analyze the human's position while they think. Linea asks for this when a human turn starts without a
+   * reply of ours before it (the first move, a resume); after our own replies it starts by itself.
+   */
+  ponder(data) {
+    const session = this.session;
+    if (!this._matches(data) || !session.ready || session.finished || session.request) return;
+    matchPosition(data.rootInitialSfen, data.moves);
+    const current = session.ponder;
+    if (current && current.root === data.rootInitialSfen && current.moves.length === data.moves.length
+      && current.moves.every((move, index) => move === data.moves[index])) return;
+    session.ponder = null;
+    this._startPonder(session, this.hooks.engine(), data.rootInitialSfen, [...data.moves]);
+  }
+
+  _startPonder(session, engine, root, moves) {
+    if (this.session !== session || session.finished || !session.ready || session.request || !engine?.running) return;
+    if (moves.length > 4096 || (moves.length && !USI_MOVE.test(moves[moves.length - 1]))) return;
+    let promise;
+    try { promise = engine.search(root, { type: 'infinite', moves }); } catch { return; }
+    session.ponder = { root, moves, promise };
+  }
+
+  /** Stops the human-turn analysis; it is reported only if the request continues from that position. */
+  _finishPonder(engine, ponder, data) {
+    const sameLine = data.rootInitialSfen === ponder.root && data.moves.length === ponder.moves.length + 1
+      && ponder.moves.every((move, index) => move === data.moves[index]);
+    engine.stop();
+    return ponder.promise.then((result) => {
+      const think = sameLine && result.status === 'done' ? thinking(result.lastParsed) : undefined;
+      return think ? { ply: ponder.moves.length, ...think } : undefined;
+    }, () => undefined);
   }
 
   cancel(data) {
@@ -129,6 +200,7 @@ class MatchSession {
       return Promise.reject(new Error('Stale search cancellation'));
     }
     session.request = null;
+    session.ponder = null;
     session.ready = false;
     session.cancelled = true;
     session.preparePromise = null;
@@ -148,6 +220,7 @@ class MatchSession {
     session.finished = true;
     session.ready = false;
     session.request = null;
+    session.ponder = null;
     session.finishPromise = this._queue(async () => {
       try {
         await this.hooks.engine()?.gameOver(data.result ?? null);
@@ -169,6 +242,7 @@ class MatchSession {
     const session = this.session;
     session.finished = true;
     session.request = null;
+    session.ponder = null;
     session.ready = false;
     return this._queue(async () => {
       await this.hooks.restore();
@@ -183,10 +257,11 @@ class MatchSession {
     const data = session.request || { sessionId: session.sessionId, epoch: session.epoch };
     session.ready = false;
     session.request = null;
+    session.ponder = null;
     session.preparePromise = null;
     this.hooks.emit('connector:match_error', { ...data, fingerprint: undefined, result: undefined, error });
     this.hooks.status();
   }
 }
 
-module.exports = { MatchSession };
+module.exports = { MatchSession, thinking, PV_LIMIT };

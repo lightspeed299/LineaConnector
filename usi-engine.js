@@ -564,6 +564,8 @@ class UsiEngine {
       const cs = go.spec.ticket;
       cs.sfen = go.sfen;
       this.currentSearch = cs;
+      // 相手番の考慮は呼び出し側の stop() まで続ける(期限なし)
+      if (go.spec.infinite) return;
       // movetime を大幅超過しても bestmove が来ない場合は stop → (stopGuard) → wedge
       this._setTimer('searchGuard', go.spec.timeoutMs ?? (go.spec.movetimeMs + 15000), () => {
         if (this.currentSearch === cs) {
@@ -612,13 +614,15 @@ class UsiEngine {
   }
 
   /**
-   * バッチ 1 局面(go movetime)。resolve は必ず 1 回:
+   * バッチ 1 局面(go movetime)・対局の手番(go btime…)・相手番の考慮(go infinite)。resolve は必ず 1 回:
    *   {status:'done', bestmove, lastParsed} | {status:'preempted'}
-   * preempted は「結果を捨てて再キューせよ」の意味。
+   * preempted は「結果を捨てて再キューせよ」の意味。infinite は stop() で bestmove を受け取って done になる。
    */
   search(sfen, limit) {
     let spec;
-    if (limit?.type === 'clock') {
+    if (limit?.type === 'infinite') {
+      spec = { positionCommand: matchPosition(sfen, limit.moves), infinite: true };
+    } else if (limit?.type === 'clock') {
       if (!Number.isSafeInteger(limit.timeoutMs) || limit.timeoutMs < 1 || limit.timeoutMs > 250_000_000) throw new Error('Invalid search timeout');
       spec = { positionCommand: matchPosition(sfen, limit.moves), clockCommand: clockCommand(limit.clock), timeoutMs: limit.timeoutMs };
     } else if (limit?.type === 'movetime' && Number.isSafeInteger(limit.movetimeMs) && limit.movetimeMs > 0 && limit.movetimeMs <= 3_900_000) {
